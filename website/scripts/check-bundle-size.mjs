@@ -96,7 +96,20 @@ export const CHUNK_BUDGETS = {
   // module: the chunk holds the same 13 catalogs plus the entry, so shrinking
   // remains unavailable for the reason stated above. Back to the 5% convention
   // over that measurement.
-  all: 12870 * KB, // measured 12254.6 KB on main @ 34fe0de33e 2026-09-21 (5.0% headroom)
+  // Re-measured 2026-09-24: the 5.0% headroom is spent again and main's tip alone
+  // builds the chunk at 13,171,024 B (12862.3 KB) against the 12870 KB ceiling --
+  // 7.7 KB left, or 0.06% headroom. Fourth recurrence of the pattern every note
+  // above describes: the ceiling drifts under 1% on accumulated catalog copy, so it
+  // fails on the next feature PR's ordinary strings rather than on the new library
+  // or surface it exists to catch. Attribution measured, not assumed: main's tip
+  // was built alone in a detached worktree at 13,171,024 B and this branch builds
+  // 13,188,006 B, so the branch's own delta is 16,982 B (16.6 KB) -- 182 added
+  // catalog lines across 13 catalogs for the eleven-trigger hook vocabulary (two
+  // marks, their two hints, and the form, toggle and row notes) plus one 58-line
+  // module. Shrinking stays unavailable for the reason stated above: no lazy
+  // import() boundary can move a catalog string out of `all`. Back to the 5%
+  // convention over the measurement that includes this branch (13,188,006 B).
+  all: 13530 * KB, // measured 12878.9 KB with this branch 2026-09-24 (5.1% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because

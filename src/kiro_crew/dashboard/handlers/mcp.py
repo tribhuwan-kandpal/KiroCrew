@@ -36,6 +36,7 @@ from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.env import emit_env
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.mcp_cleanup import mcp_entry_is_muted
 from kiro_crew.mcp_discovery import (
     SCOPE_KIRO_GLOBAL,
     SCOPE_KIROCREW,
@@ -685,6 +686,197 @@ def _record_probe_verdicts(rows: list[dict[str, Any]]) -> None:
     mcp_quarantine.record_verdicts(_quarantine_verdicts(rows))
 
 
+def _kirocrew_mcp_servers() -> dict[str, Any]:
+    """The Kiro Crew store's ``mcpServers`` map, or ``{}`` when it is not a map.
+
+    Blocking file I/O: the request handlers call it through ``asyncio.to_thread``.
+    A hand-edited store can hold a list or a string under ``mcpServers``; the
+    empty map keeps every reader on the ``.get`` path instead of raising.
+    """
+    servers = _load_json_or_empty(_kirocrew_mcp_json()).get("mcpServers", {})
+    return servers if isinstance(servers, dict) else {}
+
+
+class AmbiguousServerKey(LookupError):
+    """*name* is the alias of two or more raw keys in one config map, none exact.
+
+    Raised by :func:`_config_key_for` so that no caller can act on a guess. A
+    write that picked one spelling would edit a configuration the user did not
+    name; a write that took every spelling would delete a DISTINCT server --
+    ``team/foo`` and ``other:team/foo`` both alias to ``team-foo`` and can be two
+    servers. Readers treat it as "no entry in this map"; writers refuse and say so.
+    """
+
+    def __init__(self, name: str, count: int) -> None:
+        super().__init__(
+            f"server {name!r} is the alias of {count} entries in this config and none is "
+            f"keyed {name!r}; edit the file directly"
+        )
+        self.name = name
+        self.count = count
+
+
+def _config_key_for(servers: Any, name: str) -> str | None:
+    """The ONE key of a ``mcpServers`` map that the row *name* stands for.
+
+    A row is listed under its canonical alias (``list_servers`` step 3b folds
+    ``npm:@playwright/mcp`` into ``playwright-mcp``), but the scope files keep
+    whatever key the user or the installer wrote, so a lookup by the row's name
+    alone MISSES a slash-named entry: the table then stamps the row from nothing
+    (a shared disable reads as ``kirocrewManaged: false`` with no file to name)
+    and an Uninstall reports ``removed`` while the definition stays in the file.
+
+    Resolution is to exactly one key, never a set. The exact key wins when the
+    map holds it: that is the entry step 3b keeps as the row's representative,
+    and a raw key beside it (``team/foo`` beside ``team-foo``) is another
+    server's configuration, which an Uninstall of this row must not touch. With
+    no exact key, the single raw key whose alias is *name* is the row's source.
+    Two or more raw keys and no exact key raise :class:`AmbiguousServerKey`;
+    ``None`` when nothing names the server. A slash-free name is its own alias,
+    so ordinary rows resolve to their own key.
+    """
+    if not isinstance(servers, dict):
+        return None
+    if name in servers:
+        return name
+    matches = [key for key in servers if isinstance(key, str) and mcp_server_alias(key) == name]
+    if len(matches) > 1:
+        raise AmbiguousServerKey(name, len(matches))
+    return matches[0] if matches else None
+
+
+def _config_entry_for(servers: Any, name: str) -> dict[str, Any] | None:
+    """The entry :func:`_config_key_for` resolves *name* to, for a READ.
+
+    ``None`` when no key names the server, when the resolved value is not a
+    mapping, or when the name is ambiguous -- a read has nothing to stamp from
+    a map it cannot pin to one entry; the row's own aggregate flags, which
+    ``list_servers`` computed over every raw key, still carry the disable.
+    """
+    try:
+        key = _config_key_for(servers, name)
+    except AmbiguousServerKey:
+        return None
+    if key is None:
+        return None
+    entry = servers[key]
+    return entry if isinstance(entry, dict) else None
+
+
+def _stamp_config_state(d: dict[str, Any], global_mcps: Any, kirocrew_mcps: Any) -> None:
+    """Stamp the config-derived fields onto one serialized server row.
+
+    ``enabled`` folds every place a disable can live -- the Kiro-global
+    ``mcp.json``, the Kiro Crew store, and the row's own aggregate ``disabled``
+    flag (``list_servers`` sets it from every scope) -- and a disabled row reads
+    ``status: "disabled"``; ``kirocrewManaged`` says whether the store holds the
+    entry, which is what gates the table's Edit action.
+
+    ``disabledIn`` says WHICH scope switched the row off, because the table's
+    two disabled states need opposite controls and cannot be told apart from
+    ``enabled`` + ``kirocrewManaged``: ``"kirocrew"`` is a disable in Kiro
+    Crew's own store, which the Kiro Crew scope badge + Apply lifts (the consent
+    step); ``"shared"`` is a disable in a config this panel does not write for
+    enable -- the shared Kiro ``mcp.json`` the IDE edits, or a provider global
+    -- so the row is inert here. A row disabled in BOTH reads ``"shared"``:
+    lifting the store's flag would leave the shared flag standing, so offering
+    the consent step would offer a re-enable that cannot land. The same rule
+    holds when the shared flag sits in a provider global this helper never
+    reads: ``list_servers`` records that verdict on the row (``disabledInShared``,
+    consumed here), so a store disable never masks it. ``None`` when
+    enabled. ``disabledInFile`` names the file to edit (``~/.kiro/settings/mcp.json``,
+    the constant display form -- never resolved here) when the shared flag is
+    the Kiro-global one; ``None`` otherwise, including a disable only the
+    aggregate flag reports (a provider global), which the table words as "the
+    shared MCP config".
+
+    Both maps are read by the ONE key the row stands for
+    (:func:`_config_entry_for`): its exact key, else the single raw key whose
+    alias it is (``npm:@playwright/mcp`` for the row ``playwright-mcp``). An
+    ambiguous name stamps nothing from that map; the row's own aggregate flags
+    still carry the disable.
+
+    Pure: no filesystem call -- not a stat, not a home-directory resolution --
+    because this runs on the event loop for every row of every listing and probe
+    response. The pin is ``test_stamp_config_state_never_touches_the_filesystem``.
+
+    Every "is it off" read here is :func:`mcp_entry_is_muted`, the launch
+    predicate the gateway rewriter, the session projections and
+    ``list_servers`` share -- FAIL-CLOSED, so ``"disabled": "false"`` (a string)
+    is a disable, not a switch that failed to take. A row muted by such a value
+    also carries ``disabledReason: "invalid"`` (``None`` otherwise): for the
+    Kiro-global and store scopes it is read off the value in hand; for a disable
+    only the aggregate flag reports, it is ``list_servers``' own verdict over
+    the scopes it read. The table then says "invalid value in <file>", because
+    the operator's fix is to repair the value, not to flip a switch.
+
+    One helper for ``GET /api/mcp`` AND both probe paths, because the probe
+    response REPLACES the table's list on the client rather than overlaying it.
+    Stamped from the global file alone, a probe row for a store-disabled server
+    came back ``enabled: true`` and flipped the row live until the next GET, and
+    a row without ``kirocrewManaged`` lost its Edit action for the same interval.
+
+    Either map may come from a hand-edited file whose ``mcpServers`` is not a
+    mapping; a non-dict reads as an empty map rather than failing the whole
+    response after the probe fan-out already ran.
+    """
+    if not isinstance(global_mcps, dict):
+        global_mcps = {}
+    if not isinstance(kirocrew_mcps, dict):
+        kirocrew_mcps = {}
+    name = str(d.get("name") or "")
+    # By raw key OR alias: the row is canonical, the files are not.
+    spec = _config_entry_for(global_mcps, name) or {}
+    kc_spec = _config_entry_for(kirocrew_mcps, name)
+    d["kirocrewManaged"] = kc_spec is not None
+    shared_off = mcp_entry_is_muted(spec)
+    store_off = mcp_entry_is_muted(kc_spec)
+    is_disabled = shared_off or store_off or d.get("disabled") is True
+    # ``list_servers``' verdict for a disable neither map in hand explains.
+    row_reason = d.get("disabledReason") if d.get("disabledReason") == "invalid" else None
+    # ``list_servers``' verdict that a scope this panel does not write for enable
+    # -- the Kiro-global file or a PROVIDER global -- mutes the row. Consumed
+    # here: the table reads ``disabledIn``, and this is its one input the two
+    # maps in hand cannot supply. Without it a server disabled in a provider
+    # global AND the store read ``"kirocrew"``, so Apply lifted the store flag
+    # and the provider-global flag stood: a re-enable that could not land.
+    row_shared = d.pop("disabledInShared", None) is True
+    d["enabled"] = not is_disabled
+    d["disabledIn"] = None
+    d["disabledInFile"] = None
+    d["disabledReason"] = None
+    if not is_disabled:
+        return
+    d["status"] = "disabled"
+    if store_off and not shared_off and not row_shared:
+        d["disabledIn"] = "kirocrew"
+        d["disabledReason"] = _invalid_flag_reason(kc_spec)
+        return
+    d["disabledIn"] = "shared"
+    if shared_off:
+        # The constant, not ``display_path(_GLOBAL_MCP_JSON)``: this runs on the
+        # event loop for every row of every listing and probe response, and the
+        # resolver stats the home directory (``Path.home().resolve()``) -- a slow
+        # home mount would stall the gateway and its heartbeat. The file is the
+        # Kiro-global one by construction, so its display form is a constant.
+        d["disabledInFile"] = _KIRO_GLOBAL_SURFACE
+        d["disabledReason"] = _invalid_flag_reason(spec)
+    else:
+        d["disabledReason"] = row_reason
+
+
+def _invalid_flag_reason(entry: Any) -> str | None:
+    """``"invalid"`` when a MUTED *entry* is muted by a non-boolean ``disabled``.
+
+    Only called for an entry :func:`mcp_entry_is_muted` already answered True
+    for, so a boolean here can only be ``True`` -- a real switch, no reason to
+    add -- and anything else (``"false"``, ``1``, ``null``) is the config error
+    the row should name.
+    """
+    flag = entry.get("disabled") if isinstance(entry, dict) else None
+    return None if isinstance(flag, bool) else "invalid"
+
+
 async def _bg_mcp_probe() -> None:
     """Populate the MCP probe cache — SINGLE-FLIGHT.
 
@@ -736,6 +928,7 @@ async def _run_mcp_probe() -> None:
             global_mcps = data.get("mcpServers", {})
         except (FileNotFoundError, json.JSONDecodeError):
             pass
+        kirocrew_mcps = await asyncio.to_thread(_kirocrew_mcp_servers)
 
         # Route through probe_all() so the fan-out is bounded by its
         # PROBE_MAX_CONCURRENCY semaphore. An
@@ -746,7 +939,7 @@ async def _run_mcp_probe() -> None:
         for s in probed:
             d = s.to_dict()
             spec = global_mcps.get(s.name, {})
-            d["enabled"] = not (isinstance(spec, dict) and spec.get("disabled"))
+            _stamp_config_state(d, global_mcps, kirocrew_mcps)
             if isinstance(spec, dict) and spec.get("disabledTools"):
                 d["disabledTools"] = spec["disabledTools"]
             result.append(d)
@@ -793,20 +986,25 @@ async def api_mcp_servers(request: web.Request) -> web.Response:
     # Browse) so status transitions from "Unknown" to "ok"/"error" on the
     # next page refresh without waiting out the cache TTL.
     #
-    # Only consider rows probe_all() would actually probe. It excludes
-    # consent-disabled servers on purpose (probing spawns the process), so a
-    # disabled row can never enter _mcp_probe_cache — while list_servers()
-    # deliberately returns it so the UI can render the row. Comparing the
-    # unfiltered list against the cache would treat every disabled
-    # server as "new" on EVERY request, bypassing the cache TTL and leaving a
-    # full spawn fan-out permanently in flight for anyone with one disabled
-    # server. Applying probe_all's own filter here keeps the freshness check
-    # and the cache contents talking about the same set.
+    # Only consider rows probe_all() would actually PROBE. It never spawns a
+    # consent-disabled server, so a disabled row enters _mcp_probe_cache only
+    # as an unprobed ``status: "disabled"`` placeholder (or not at all, from a
+    # cache filled before the server was disabled) -- its presence says nothing
+    # about freshness, and comparing the unfiltered list against the cache would
+    # treat a disabled server as "new" on EVERY request, bypassing the cache TTL
+    # and leaving a full spawn fan-out permanently in flight for anyone with one
+    # disabled server. Applying probe_all's own spawn filter here keeps the
+    # freshness check and the cache contents talking about the same set.
     if not stale:
         for srv in servers:
             if srv.disabled:
                 continue
-            if srv.name not in cached_by_name:
+            cached = cached_by_name.get(srv.name)
+            # A ``disabled`` placeholder is not a probe: the server was withheld
+            # from the spawn set when the cache was filled. An enabled row behind
+            # one -- the operator re-enabled the server inside the TTL -- has never
+            # been probed, so it re-arms the fan-out exactly like an absent row.
+            if cached is None or cached.get("status") == "disabled":
                 stale = True
                 break
 
@@ -822,27 +1020,23 @@ async def api_mcp_servers(request: web.Request) -> web.Response:
         pass
     # KiroCrew-scope entries: disabled state (consent-disabled installs and
     # custom adds live only here) + which rows the JSON editor can manage.
-    kirocrew_mcps = _load_json_or_empty(_kirocrew_mcp_json()).get("mcpServers", {})
+    # Off the loop, like the probe and probe-cache sites: the helper is blocking
+    # file I/O (``read_text`` + ``json.loads``), and this handler runs for every
+    # page load -- a slow data-home mount would stall the loop and its heartbeat.
+    kirocrew_mcps = await asyncio.to_thread(_kirocrew_mcp_servers)
     result: list[dict] = []
     for s in servers:
         d = s.to_dict()
-        # Prefer handler cache status over discovery cache "outdated"
+        # Prefer handler cache status over discovery cache "outdated". A cached
+        # ``disabled`` placeholder carries no observation, so it never overlays a
+        # row that is enabled now; a row still disabled reads ``disabled`` from
+        # its own config state below.
         cached = cached_by_name.get(s.name)
-        if cached and d["status"] in ("outdated", "unknown"):
+        if cached and cached.get("status") != "disabled" and d["status"] in ("outdated", "unknown"):
             d["status"] = cached.get("status", d["status"])
             d["tools"] = cached.get("tools", d["tools"])
             d["error"] = cached.get("error", d["error"])
-        spec = global_mcps.get(s.name, {})
-        kc_spec = kirocrew_mcps.get(s.name)
-        d["kirocrewManaged"] = isinstance(kc_spec, dict)
-        is_disabled = (
-            (isinstance(spec, dict) and spec.get("disabled"))
-            or (isinstance(kc_spec, dict) and kc_spec.get("disabled"))
-            or s.disabled
-        )
-        d["enabled"] = not is_disabled
-        if is_disabled:
-            d["status"] = "disabled"
+        _stamp_config_state(d, global_mcps, kirocrew_mcps)
         err = d.get("error")
         if err:
             err, _ = redact_credentials(err)
@@ -931,7 +1125,7 @@ async def api_mcp_active(request: web.Request) -> web.Response:
             return web.json_response([])
         return web.json_response([{"name": n, "enabled": True} for n in agent_mcps])
 
-    # Kirocrew / default: read from global mcp.json
+    # Kiro Crew / default: every scope, through the one launch predicate.
     from kiro_crew.mcp_discovery import list_servers  # noqa: F811
 
     global_mcps: dict[str, Any] = {}
@@ -940,11 +1134,21 @@ async def api_mcp_active(request: web.Request) -> web.Response:
         global_mcps = data.get("mcpServers", {})
     except (FileNotFoundError, json.JSONDecodeError):
         pass
+    kirocrew_mcps = await asyncio.to_thread(_kirocrew_mcp_servers)
     servers = list_servers()
     result: list[dict] = []
     for s in servers:
-        spec = global_mcps.get(s.name, {})
-        enabled = not (isinstance(spec, dict) and spec.get("disabled"))
+        # The launch predicate (fail-closed) over the Kiro-global file AND the
+        # Kiro Crew store, plus the row's own aggregate flag (every scope
+        # ``list_servers`` read, provider globals included), so this listing and
+        # the sessions agree on what is off. Read from the shared file alone, a
+        # registry install awaiting consent -- ``disabled: true`` in the store,
+        # absent from the shared file -- answered ``enabled: true``.
+        enabled = not (
+            s.disabled
+            or mcp_entry_is_muted(_config_entry_for(global_mcps, s.name))
+            or mcp_entry_is_muted(_config_entry_for(kirocrew_mcps, s.name))
+        )
         result.append({"name": s.name, "enabled": enabled})
     # Also include the managed KiroCrew servers (always enabled). NOTE for
     # ``kirocrew-computer``: "enabled" here means the SERVER is registered, not
@@ -991,11 +1195,12 @@ async def api_mcp_probe(request: web.Request) -> web.Response:
         global_mcps = data.get("mcpServers", {})
     except (FileNotFoundError, json.JSONDecodeError):
         pass
+    kirocrew_mcps = await asyncio.to_thread(_kirocrew_mcp_servers)
     result: list[dict[str, Any]] = []
     for s in servers:
         d = s.to_dict()
         spec = global_mcps.get(s.name, {})
-        d["enabled"] = not (isinstance(spec, dict) and spec.get("disabled"))
+        _stamp_config_state(d, global_mcps, kirocrew_mcps)
         if isinstance(spec, dict) and spec.get("disabledTools"):
             d["disabledTools"] = spec["disabledTools"]
         result.append(d)
@@ -1475,7 +1680,18 @@ async def api_mcp_toggle(request: web.Request) -> web.Response:
             return web.json_response({"error": "cannot parse global mcp.json"}, status=500)
 
         servers = data.setdefault("mcpServers", {})
-        if name not in servers:
+        # By the ONE key the row stands for -- raw or alias: the table asks for
+        # ``playwright-mcp``, the file may hold ``npm:@playwright/mcp``. A stub
+        # written beside the raw entry would show the row Disabled while the
+        # rebuild kept mounting the entry the flag never reached. A name that is
+        # the alias of several raw keys is refused rather than guessed: the flag
+        # would land on an entry the user did not name, or on a stub none of
+        # them reads.
+        try:
+            key = _config_key_for(servers, name)
+        except AmbiguousServerKey as exc:
+            return web.json_response({"error": str(exc)}, status=409)
+        if key is None:
             # Server may exist in another scope (agent config, ~/.claude.json).
             # Create a stub so we can store disabled state here.
             from kiro_crew.mcp_discovery import (
@@ -1486,11 +1702,12 @@ async def api_mcp_toggle(request: web.Request) -> web.Response:
             if name not in known:
                 return web.json_response({"error": f"server {name!r} not found"}, status=404)
             servers[name] = {}
+            key = name
 
-        spec = servers[name]
+        spec = servers[key]
         if not isinstance(spec, dict):
             if isinstance(spec, str):
-                servers[name] = spec = {"command": spec}
+                servers[key] = spec = {"command": spec}
             else:
                 return web.json_response(
                     {"error": f"server {name!r} has invalid config type: {type(spec).__name__}"},
@@ -2012,7 +2229,8 @@ def _find_server_spec_anywhere(name: str) -> dict | None:
     """
 
     def _usable(data: dict[str, Any]) -> dict | None:
-        spec = data.get("mcpServers", {}).get(name)
+        # By raw key or alias: a slash-named entry serves its canonical row.
+        spec = _config_entry_for(data.get("mcpServers", {}), name)
         if isinstance(spec, dict) and (spec.get("command") or spec.get("url")):
             return {k: v for k, v in spec.items() if k != "disabled"}
         return None
@@ -2079,8 +2297,11 @@ def _set_kirocrew_entry(name: str, *, enabled: bool, spec: dict | None = None) -
             servers[name] = {k: v for k, v in (spec or {}).items() if k != "disabled"}
             action = "added"
         else:
-            # Remove disabled flag if set; otherwise no change needed.
-            if existing.get("disabled") is True:
+            # Lift whatever MUTES the entry -- ``true`` or a non-boolean the
+            # launch predicate reads fail-closed. Testing for the literal
+            # ``True`` alone left ``"disabled": "false"`` in place as a "noop",
+            # so the row stayed Disabled and the consent step could never land.
+            if mcp_entry_is_muted(existing):
                 existing.pop("disabled", None)
                 action = "enabled"
             else:
@@ -2093,6 +2314,9 @@ def _set_kirocrew_entry(name: str, *, enabled: bool, spec: dict | None = None) -
             servers[name] = entry
             action = "disabled"
         elif existing.get("disabled") is True:
+            # The literal, not the predicate: a non-boolean already mutes the
+            # entry, but the write below repairs it into the boolean the schema
+            # wants, so only a real ``true`` is a no-op.
             return "noop"
         else:
             existing["disabled"] = True
@@ -2123,22 +2347,37 @@ def _replace_kirocrew_spec(name: str, spec: dict) -> bool:
     if not isinstance(existing, dict):
         return False
     entry = {k: v for k, v in spec.items() if k != "disabled"}
-    if existing.get("disabled") is True:
+    # The launch predicate: an entry a non-boolean mutes stays muted through an
+    # edit -- and comes out as the boolean the schema wants. Keeping only a
+    # literal ``True`` would have dropped ``"disabled": "false"`` and turned a
+    # spec edit into the consent it is not.
+    if mcp_entry_is_muted(existing):
         entry["disabled"] = True
     servers[name] = entry
     _atomic_write(_kirocrew_mcp_json(), data)
     return True
 
 
-def _remove_kirocrew_entry(name: str) -> bool:
-    """Delete the server from ``<data home>/mcp.json`` entirely.  Returns True on change."""
+def _remove_kirocrew_entry(name: str) -> str:
+    """Delete the server from ``<data home>/mcp.json``. Returns the action label.
+
+    The ONE key the row stands for goes (:func:`_config_key_for`): the row asks
+    by its canonical alias, the file may hold the raw ``npm:@...`` spelling.
+    ``"removed"`` on change, ``"noop"`` when nothing names it, ``"ambiguous"``
+    when the name is the alias of several raw keys and none is exact -- then
+    nothing is deleted, because one of them may be a distinct server.
+    """
     data = _load_json_or_empty(_kirocrew_mcp_json())
     servers = data.get("mcpServers", {})
-    if name not in servers:
-        return False
-    del servers[name]
+    try:
+        key = _config_key_for(servers, name)
+    except AmbiguousServerKey:
+        return "ambiguous"
+    if key is None:
+        return "noop"
+    del servers[key]
     _atomic_write(_kirocrew_mcp_json(), data)
-    return True
+    return "removed"
 
 
 def _remove_from_agent_file(path: Path, name: str) -> bool:
@@ -2179,9 +2418,13 @@ def _remove_from_agent_file(path: Path, name: str) -> bool:
     with _agent_file_lock(target=path):
         data = _load_json_or_empty(path)
         servers = data.get("mcpServers", {})
-        if not isinstance(servers, dict) or name not in servers:
+        try:
+            key = _config_key_for(servers, name)
+        except AmbiguousServerKey:
             return False
-        del servers[name]
+        if key is None:
+            return False
+        del servers[key]
         _atomic_write(path, data)
     return True
 
@@ -2192,17 +2435,28 @@ def _set_scope_entry(path: Path, name: str, *, enabled: bool, spec: dict | None 
     When enabled=True and the server is absent, adds the spec.  When
     enabled=False, removes the entry entirely (NOT soft-disable — the
     dashboard badge treats absent and disabled identically).
+
+    "The server" is the ONE key that names it (:func:`_config_key_for`): the
+    caller passes the row's canonical alias, the file may hold the raw
+    slash-named key. Enabling clears the mute on it; removing deletes it; neither
+    adds a second, alias-keyed copy beside a raw-keyed one. A name that is the
+    alias of several raw keys with no exact key returns ``"ambiguous"`` and
+    writes nothing: one of those keys may be a distinct server.
     """
     data = _load_json_or_empty(path)
     servers = data.setdefault("mcpServers", {})
-    present = name in servers and isinstance(servers[name], dict)
+    try:
+        key = _config_key_for(servers, name)
+    except AmbiguousServerKey:
+        return "ambiguous"
+    entry = servers.get(key) if key is not None else None
 
     if enabled:
-        if present:
-            # Already enabled; if the entry had disabled:true, clear it.
-            s = servers[name]
-            if isinstance(s, dict) and s.get("disabled") is True:
-                s.pop("disabled", None)
+        if isinstance(entry, dict):
+            # Already enabled; if the entry is muted (``true`` or a non-boolean
+            # the launch predicate reads fail-closed), clear it.
+            if mcp_entry_is_muted(entry):
+                entry.pop("disabled", None)
                 _atomic_write(path, data)
                 return "enabled"
             return "noop"
@@ -2214,11 +2468,48 @@ def _set_scope_entry(path: Path, name: str, *, enabled: bool, spec: dict | None 
         _atomic_write(path, data)
         return "added"
     # enabled=False — hard remove.
-    if not present:
+    if key is None or not isinstance(entry, dict):
         return "noop"
-    del servers[name]
+    del servers[key]
     _atomic_write(path, data)
     return "removed"
+
+
+def _ambiguous_uninstall_names(names: Collection[str]) -> dict[str, list[str]]:
+    """Which of *names* no scope can resolve to ONE key, and in which scopes.
+
+    Run BEFORE an apply's first side effect. An uninstall is two phases --
+    companion package removal off the lock, then config removal under it -- and a
+    scope that later answers ``"ambiguous"`` (:func:`_config_key_for`) would
+    leave that configuration standing after the package is gone, inside a
+    response that reads as a successful apply. A refusal is not a commit: the
+    request is refused whole, before Phase 1, and nothing is logged as applied.
+
+    Reads every scope the purge would write -- the store, the Kiro-global file,
+    each provider global and the rendered agent files -- with the same resolver
+    the writers use. Blocking file I/O: call through ``asyncio.to_thread``. The
+    check and the purge are not one transaction; a config edited between them is
+    caught again by the writers, whose ``"ambiguous"`` is then reported as the
+    change's error rather than as a removal.
+    """
+    scopes: list[tuple[str, Path]] = [
+        (SCOPE_KIROCREW, _kirocrew_mcp_json()),
+        (SCOPE_KIRO_GLOBAL, _GLOBAL_MCP_JSON),
+        ("agent", kiro_agents_dir() / "kirocrew.json"),
+    ]
+    for scope in _extra_mcp_scopes():
+        scopes.append((f"{scope.id}Global", scope.global_json))
+        if scope.agent_mcp_file is not None:
+            scopes.append((f"{scope.id}Agent", scope.agent_mcp_file))
+    maps = [(label, _load_json_or_empty(path).get("mcpServers", {})) for label, path in scopes]
+    refused: dict[str, list[str]] = {}
+    for name in names:
+        for label, servers in maps:
+            try:
+                _config_key_for(servers, name)
+            except AmbiguousServerKey:
+                refused.setdefault(name, []).append(label)
+    return refused
 
 
 def _purge_server_config(name: str, *, scopes: Collection[str] | None = None) -> dict[str, str]:
@@ -2244,10 +2535,16 @@ def _purge_server_config(name: str, *, scopes: Collection[str] | None = None) ->
     at all otherwise: they are Kiro Crew's own merge output rather than a scope a
     user edits, and leaving the entry there lets the next rebuild resurrect what
     was just removed.
+
+    Each scope removes the ONE key the row stands for (:func:`_config_key_for`),
+    never every key that aliases to the name: ``team/foo`` beside ``team-foo`` is
+    two configurations, and an Uninstall of the row ``team-foo`` leaves
+    ``team/foo`` byte for byte. A scope in which the name is the alias of several
+    raw keys and none is exact reports ``"ambiguous"`` and is left untouched.
     """
     actions: dict[str, str] = {}
     if scopes is None or SCOPE_KIROCREW in scopes:
-        actions[SCOPE_KIROCREW] = "removed" if _remove_kirocrew_entry(name) else "noop"
+        actions[SCOPE_KIROCREW] = _remove_kirocrew_entry(name)
     if scopes is None or SCOPE_KIRO_GLOBAL in scopes:
         actions[SCOPE_KIRO_GLOBAL] = _set_scope_entry(_GLOBAL_MCP_JSON, name, enabled=False)
     for scope in _extra_mcp_scopes():
@@ -2536,6 +2833,35 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
     # guaranteed-cleanup sweep does not redundantly re-purge them.
     purged_names: set[str] = set()
 
+    # ── Phase 0: refuse what no scope can resolve, before any side effect ──
+    # An uninstall by a name that is the alias of several raw keys (``team/foo``
+    # beside ``other:team/foo``, none keyed ``team-foo``) has no one entry to
+    # remove. Refused HERE, as a request failure the table shows and keeps the
+    # pending change for -- never inside the loop, where the companion package
+    # would already be gone and the ``"ambiguous"`` scope label would ride a
+    # response the table reads as applied. Nothing is logged as an uninstall.
+    if uninstall_names:
+        ambiguous = await asyncio.to_thread(_ambiguous_uninstall_names, uninstall_names)
+        if ambiguous:
+            sel().log_api_access(
+                caller="dashboard",
+                operation="mcp_apply_rejected_ambiguous",
+                outcome="denied",
+                resources=",".join(sorted(ambiguous))[:64],
+            )
+            detail = "; ".join(
+                f"{name!r} is the alias of several entries in {', '.join(scopes)} and none is "
+                f"keyed {name!r}"
+                for name, scopes in sorted(ambiguous.items())
+            )
+            return web.json_response(
+                {
+                    "error": f"uninstall refused: {detail}; edit the file directly",
+                    "ambiguous": ambiguous,
+                },
+                status=409,
+            )
+
     try:
         if uninstall_names:
             from kiro_crew.dashboard.handlers._shared import _capability_manager
@@ -2627,6 +2953,29 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
                     # lock); merge its recorded result here.
                     if name in capability_results:
                         outcome["actions"].update(capability_results[name])
+                    # Phase 0 refused every name a scope could not resolve; a scope
+                    # answering ``ambiguous`` here means the config moved under the
+                    # check. That is a refusal, not a removal: say so on the change
+                    # and do not log it as an uninstall.
+                    ambiguous_scopes = sorted(
+                        scope
+                        for scope, action in outcome["actions"].items()
+                        if action == "ambiguous"
+                    )
+                    if ambiguous_scopes:
+                        outcome["error"] = (
+                            f"not removed from {', '.join(ambiguous_scopes)}: {name!r} is the alias "
+                            f"of several entries there and none is keyed {name!r}; edit the file "
+                            "directly"
+                        )
+                        sel().log_api_access(
+                            caller="dashboard",
+                            operation="mcp_apply_rejected_ambiguous",
+                            outcome="denied",
+                            resources=name,
+                        )
+                        results.append(outcome)
+                        continue
                     sel().log_api_access(
                         caller="dashboard",
                         operation="mcp_uninstall",

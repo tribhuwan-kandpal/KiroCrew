@@ -169,39 +169,55 @@ def joins_to_a_credential(head: str, tail: str, redactor: Callable[[str], str]) 
     return any(redactor(reading) != reading for reading in readings)
 
 
-def safe_split_offset(text: str, limit: int, redactor: Callable[[str], str]) -> int:
+def safe_split_offset(
+    text: str,
+    limit: int,
+    redactor: Callable[[str], str],
+    present: Callable[[str], str] | None = None,
+) -> int:
     """The largest SAMPLED offset at or below *limit* that severs no credential.
 
-    Not the largest safe offset: the candidates are sampled, so a safe offset
-    between two samples is passed over. Those characters are not lost, only
-    deferred to the next delivery.
+    *present* maps a side to the form the platform will actually DELIVER, and both
+    sides go through it before grading. It has to be the caller's own, because a
+    renderer that strips steering markers, horizontal rules or surrounding whitespace
+    on the way out delivers something shorter than the raw slice: grading the raw
+    slice then accepts an offset whose delivered halves sit flush together. Worse than
+    accepting it once -- the search is deterministic, so a caller that re-grades the
+    answer in delivered form and rejects it gets the SAME answer every time and the
+    segment never goes out at all. Default is identity, for a caller that delivers
+    its text verbatim.
 
-    Used by a renderer whose message cap forces *text* into two deliveries: cut
-    here and :func:`joins_to_a_credential` is false, so the reader cannot rejoin a
-    key across the boundary.
+    Not the largest safe offset: the candidates are sampled, so a safe offset between
+    two samples is passed over. Those characters are not lost, only deferred to the
+    next delivery.
+
+    Used by a renderer whose message cap forces *text* into two deliveries: cut here
+    and :func:`joins_to_a_credential` is false of the delivered halves, so the reader
+    cannot rejoin a key across the boundary.
 
     Candidates step back EXPONENTIALLY (``limit``, then 1, 2, 4, 8 ... characters
-    before it), for a cost bound: the nearest safe boundary is not needed, only a
-    safe one, and stepping past it merely defers a few more characters to the next
+    before it), for a cost bound: the nearest safe boundary is not needed, only a safe
+    one, and stepping past it merely defers a few more characters to the next
     delivery. A linear walk would be O(*limit*) redaction passes over
     attacker-influenced text on every frame; this is O(log *limit*), and the common
-    case -- prose, where any cut is safe -- costs one pass, or none at all when
-    *text* already fits.
+    case -- prose, where any cut is safe -- costs one pass, or none at all when *text*
+    already fits.
 
-    ``0`` means every SAMPLED candidate was unsafe -- one matched region covers all
-    of them. A safe offset between two samples may still exist; the search does not
-    look for it, because the answer it needs is only "is there a safe cut I can take
-    now". Callers treat ``0`` as "deliver nothing yet", which is always available to
-    them: text withheld now is text the next delivery carries.
+    ``0`` means every SAMPLED candidate was unsafe -- one matched region covers all of
+    them. A safe offset between two samples may still exist; the search does not look
+    for it, because the answer it needs is only "is there a safe cut I can take now".
+    Callers treat ``0`` as "deliver nothing yet", which is always available to them:
+    text withheld now is text the next delivery carries.
     """
     if limit <= 0:
         return 0
     if limit >= len(text):
         # Nothing is severed, so there is no boundary to check.
         return len(text)
+    shown = present or (lambda piece: piece)
     offset, step = limit, 0
     while offset > 0:
-        if not joins_to_a_credential(text[:offset], text[offset:], redactor):
+        if not joins_to_a_credential(shown(text[:offset]), shown(text[offset:]), redactor):
             return offset
         step = 1 if step == 0 else step * 2
         offset = limit - step
@@ -281,6 +297,16 @@ def redact_across_delivery(delivered: str, pending: str, redactor: Callable[[str
     Withholding is NOT an alternative here. The text must be delivered eventually,
     and a later seal redacts only its own segment -- it cannot see the half that is
     already gone -- so deferring would ship the completion untouched.
+
+    The result is verified with the SAME predicate that fired, and that check is not
+    ceremony: :func:`redact_for_display` scans a strictly SMALLER set of readings than
+    :func:`severs_a_credential` -- it has no per-piece canonical reading -- so its
+    rewrite can leave a match that only that reading sees, and a cut inside a link's
+    target is exactly such a match. When the rewrite is not enough, the completion is
+    dropped from the front of the pending side, stepping until the predicate is
+    satisfied; the key's tail is what sits at that edge, so this removes the
+    characters that complete it. The empty string is always safe -- *delivered* alone
+    is already a fixed point -- so the walk terminates.
     """
     if not delivered or not severs_a_credential([delivered, pending], redactor):
         return pending
@@ -288,7 +314,15 @@ def redact_across_delivery(delivered: str, pending: str, redactor: Callable[[str
     keep, bound = 0, min(len(joined), len(delivered))
     while keep < bound and joined[keep] == delivered[keep]:
         keep += 1
-    return joined[keep:]
+    candidate = joined[keep:]
+    if not severs_a_credential([delivered, candidate], redactor):
+        return candidate
+    drop = 1
+    while drop < len(candidate):
+        if not severs_a_credential([delivered, candidate[drop:]], redactor):
+            return candidate[drop:]
+        drop *= 2
+    return ""
 
 
 def redact_for_display(text: str, redactor: Callable[[str], str]) -> tuple[str, bool]:

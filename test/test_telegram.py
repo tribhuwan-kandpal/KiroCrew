@@ -27,7 +27,11 @@ from kiro_crew.acp.client import AcpError
 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS, EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.dashboard.token_auth import parse_duration
 from kiro_crew.messaging.commands import parse_dashboard_ttl
-from kiro_crew.messaging.display_safety import canonicalize_display
+from kiro_crew.messaging.display_safety import (
+    canonicalize_display,
+    joins_to_a_credential,
+    safe_split_offset,
+)
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
@@ -70,6 +74,7 @@ from kiro_crew.telegram.commands import (
 from kiro_crew.telegram.renderer import (
     TelegramApprovalDecider,
     TelegramRenderer,
+    _delivered_form,
     _extract_options,
     _has_table,
     _may_exceed_rendered,
@@ -5987,6 +5992,41 @@ class TestRotationSeamCredentialSafety:
         frames = [text for text, _kb in cli.sent]
         assert len(frames) >= 2, f"fixture did not rotate into separate bubbles: {len(frames)}"
         self._assert_no_key_on_screen(frames)
+
+    def test_the_fallback_offset_is_one_the_caller_can_take(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The search must grade the DELIVERED form, or the segment deadlocks.
+
+        Graded raw, the budget offset looks safe here -- a newline and an indent sit
+        between the halves and no credential pattern tolerates whitespace -- so the
+        exponential back-off never runs and the first sample is returned. A caller
+        that then re-graded in delivered form would reject it, and because the search
+        is deterministic it would get the same answer on every later rotation: the
+        segment would never go out at all.
+        """
+        raw = "a" * (self._CAP - 8) + "AKIAIOSF" + "\n    ODNN7EXAMPLE" + " tail" * 40
+        raw_offset = safe_split_offset(raw, self._CAP, _default_redactor)
+        assert not joins_to_a_credential(
+            raw[:raw_offset], raw[raw_offset:], _default_redactor
+        ), "fixture no longer exercises the raw-vs-delivered gap"
+        assert joins_to_a_credential(
+            _delivered_form(raw[:raw_offset]),
+            _delivered_form(raw[raw_offset:]),
+            _default_redactor,
+        ), "fixture no longer exercises the raw-vs-delivered gap"
+
+        shown = safe_split_offset(raw, self._CAP, _default_redactor, _delivered_form)
+        assert shown, "the delivered-form search withheld instead of stepping back"
+        assert shown != raw_offset, "the delivered-form search returned the raw answer"
+        assert not joins_to_a_credential(
+            _delivered_form(raw[:shown]), _delivered_form(raw[shown:]), _default_redactor
+        ), "the offset the search returned still severs a key once delivered"
+
+        r, cli = self._renderer(monkeypatch)
+        r._buf = [raw]
+        asyncio.run(r._rotate_on_length())
+        assert cli.sent, "the rotation withheld on an offset it could have taken"
 
     def test_a_markup_span_covering_a_whole_piece_is_caught(
         self, monkeypatch: pytest.MonkeyPatch

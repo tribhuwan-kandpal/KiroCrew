@@ -77,7 +77,11 @@ from kiro_crew.discord.transport_dispatch import (
 )
 from kiro_crew.messaging import driver as messaging_driver
 from kiro_crew.messaging.attachments import cleanup
-from kiro_crew.messaging.display_safety import canonicalize_display
+from kiro_crew.messaging.display_safety import (
+    canonicalize_display,
+    redact_across_delivery,
+    severs_a_credential,
+)
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
@@ -1365,6 +1369,44 @@ class TestRotationSeamCredentialSafety:
         await r._rotate_on_length()
         await r._seal_current(extract_uploads=False)
         self._assert_no_key_on_screen([text for text, _ in cli.sent])
+
+
+class TestCrossDeliveryRedaction:
+    """``redact_across_delivery`` -- the boundary with a message already on screen."""
+
+    def test_the_result_answers_to_the_detector_that_fired(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The remedy is verified by ``severs_a_credential``, not by a weaker scanner.
+
+        ``redact_for_display`` reads fewer forms than the detector -- it has no
+        per-piece canonical reading -- so its rewrite is a first attempt, not the
+        answer. Here it is stubbed to a no-op, which is the worst case that reading
+        gap can produce, and the function must still hand back something the detector
+        accepts rather than the completion it was given.
+        """
+        monkeypatch.setattr(
+            "kiro_crew.messaging.display_safety.redact_for_display",
+            lambda text, redactor: (text, False),
+        )
+        delivered, pending = "a key begins AKIAIOSF", "ODNN7EXAMPLE and more prose"
+        assert severs_a_credential([delivered, pending], _default_redactor), "fixture is inert"
+
+        out = redact_across_delivery(delivered, pending, _default_redactor)
+        assert out != pending, "the completion was shipped unchanged"
+        assert not severs_a_credential([delivered, out], _default_redactor)
+
+    def test_an_innocent_pending_message_is_untouched(self) -> None:
+        assert (
+            redact_across_delivery("all clear here", "and more prose", _default_redactor)
+            == "and more prose"
+        )
+
+    @pytest.mark.parametrize(("head", "tail"), CREDENTIAL_STRADDLE_SHAPES)
+    def test_every_straddle_shape_is_safe_after_the_remedy(self, head: str, tail: str) -> None:
+        assert severs_a_credential([head, tail], _default_redactor), "fixture is inert"
+        out = redact_across_delivery(head, tail, _default_redactor)
+        assert not severs_a_credential([head, out], _default_redactor)
 
 
 class TestOptionComponents:

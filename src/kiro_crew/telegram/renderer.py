@@ -1323,26 +1323,31 @@ class TelegramRenderer(Renderer):
             # inflation actually observed and look again, which is the same loop the
             # splitter itself runs -- a safe cut that fits is worth more than giving
             # up on the rotation, since a deferral holds the whole buffer.
-            budget, head = limit, ""
+            # The search grades the DELIVERED form of both sides, so the offset it
+            # returns is one this caller can take. Grading raw here and re-checking
+            # afterwards would deadlock the segment: the search is deterministic, so a
+            # rejected answer is the same answer every rotation and nothing ever goes
+            # out. Off the loop for the cost reason the redaction above carries -- each
+            # sampled offset is two full-buffer redaction passes.
+            budget, head, offset = limit, "", 0
             while True:
-                offset = safe_split_offset(raw, budget, _default_redactor)
+                offset = await asyncio.to_thread(
+                    safe_split_offset, raw, budget, _default_redactor, _delivered_form
+                )
                 head = raw[:offset]
-                worst = _rendered_len(head)
+                worst = await asyncio.to_thread(_rendered_len, head)
                 if not offset or worst <= rendered_cap:
                     break
                 if budget <= _MIN_SPLIT_LIMIT:
                     offset = 0
                     break
                 budget = _shrunk_limit(budget, rendered_cap, worst)
-            slices = [head, raw[offset:]]
-            if not offset or await asyncio.to_thread(
-                severs_a_credential, [_delivered_form(p) for p in slices], _default_redactor
-            ):
+            if not offset:
                 # Deliver NOTHING: the withheld text rides the next rotation, and the
                 # final seal re-splits and seals an over-cap segment chunk by chunk.
                 self._buf = [raw + protocol_suffix]
                 return
-            chunks = slices
+            chunks = [head, raw[offset:]]
         for ch in chunks[:-1]:
             self._buf = [ch]
             # A length rotation never extracts: only a SEMANTIC seal (steer
@@ -1737,7 +1742,6 @@ class TelegramRenderer(Renderer):
         text = await asyncio.to_thread(
             redact_across_delivery, self._delivered_closed, text, _default_redactor
         )
-        self._last_landed = text
         if footer:
             # A quoted line under the answer rather than a separate message: the
             # footer is metadata about the turn, and a second bubble for it would
@@ -1811,6 +1815,10 @@ class TelegramRenderer(Renderer):
                         )
                     if ok:
                         self._tally_redactions(text)
+                        # Recorded only where delivery is CONFIRMED: this text becomes
+                        # the predecessor the next segment is graded against, and a
+                        # send that failed is not on anyone's screen.
+                        self._last_landed = text
                         return
                     # Both edits failed — the live message is gone (e.g. the user
                     # deleted it mid-turn). Fall through and SEND the final content so
@@ -1834,6 +1842,7 @@ class TelegramRenderer(Renderer):
                     )
                 if mid is not None:
                     self._tally_redactions(text)
+                    self._last_landed = text
 
             finally:
                 # Retire the live message: this segment is final, so nothing

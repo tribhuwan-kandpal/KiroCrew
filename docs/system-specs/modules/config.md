@@ -2033,6 +2033,7 @@ class DashboardConfig:
     theme_mode: str = ""           # "dark" | "light" | "system"; empty = unset (frontend falls back to localStorage or "system")
     theme_color: str = ""          # color-theme slug (e.g. "kiro", "emerald", "monokai"); empty = unset
     language: str = ""             # dashboard UI language, BCP-47 (e.g. "en", "zh-CN"); empty = auto-detect from the browser. See "Dashboard UI language" below.
+    folder_sort: str = "custom"    # sidebar folder order: "custom" (stored positions) | "name" (natural, 01. < 02. < 10.) | "created" (newest first). A view preference; never rewrites a folder's stored order. See "Sidebar folder order" below.
     onboarded: bool = False         # whether the "Choose your look" onboarding modal was completed
     import_onboarded: bool = False  # whether foreign-agent import was completed or skipped
     crewmates_onboarded: bool = False  # whether the first-run Meet CrewMates flow was finished or dismissed
@@ -2410,6 +2411,42 @@ appears.
 (shared across ports and devices) rather than browser-local. The frontend reads
 them at boot via `GET /api/theme/boot`; empty `theme_mode`/`theme_color` mean
 unset (the frontend falls back to `localStorage` or the built-in default).
+
+### Sidebar folder order
+
+`DashboardConfig.folder_sort` is the chat sidebar's folder sort mode — `custom`
+(the stored per-container `order` positions set by dragging or by the
+`chat_folder_move` tool; the default, so an upgrade changes nothing), `name` (a
+case-insensitive natural order, so `01.` < `02.` < `10.`) or `created` (newest first
+on the `created_at` epoch stamp every folder creator writes). It is workspace-
+persistent rather than browser-local because two readers must agree on it: the
+sidebar (and the folder pickers) through the shared `GET /api/config/kirocrew`
+query, and the `kirocrew-dashboard` MCP server's `chat_folder_tree`, which reads the
+same `config.json` through the loader (the HTTP route is cookie-only) and lists
+folders in the order the sidebar draws them so an agent can pick a `before`/`after`
+anchor from it (see `docs/architecture/mcp.md`). Written only through the
+`PATCH /api/config/kirocrew` allowlist (`dashboard.folder_sort`, enum
+`FOLDER_SORT_MODES`); the loader reads anything outside that set as `custom`.
+Choosing a mode is a VIEW change — no folder's stored `order` is rewritten — so
+switching back to `custom` restores the manual arrangement exactly. A sidebar
+drag among siblings is a write to the stored positions computed against the drawn
+order, so it is offered only when the mode is known to be `custom`: outside that
+(and while the settings query is still loading or has failed, when the tree draws
+the stored order as a fallback) the folder rows stop being reorder targets — their
+sortable's droppable side is off, so no slot opens — while dragging a folder into
+another still works; the status line that answers such a drop carries a
+**Switch to Custom** action on the same write path as the menu row. What the UI
+keys on is what it KNOWS, never the transient query status (`useFolderSortRead`):
+the mode is known when a config body is on hand — fresh, cached, or kept across a
+failed background refetch, which react-query retries on its own and which is
+therefore silent; a read that failed with no body to fall back on is said on an
+`ErrorNotice`, LATCHED through the retry's pending phase so the banner does not
+unmount and remount around each automatic retry, and cleared when a body arrives.
+One screen says it once: the sidebar's banner over its tree (with a plain subline,
+*Showing your saved arrangement; retries automatically*), and, on the screens with
+no sidebar, the job form beside its folder picker and the Command Bar above its
+folder list; the session menu and the folder-suggestion card add no copy of their
+own.
 
 ### Interactive model picker visibility
 

@@ -2127,6 +2127,73 @@ def _teardown_failure(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
 
 
+@dataclass(frozen=True)
+class _ProcessHandle:
+    """What a kill needs of a run's session process, taken BEFORE the reset.
+
+    ``SessionLifecycle.reset`` pops the session out of the session map under its
+    lock before the awaits that can hang (the end record, the unlink, the child
+    probes, the provider shutdown), so once ``wait_for(reset)`` has timed out the
+    map does not name the process the reset could not stop. A kill that looks
+    the session up afterwards finds nothing, and without this handle it would
+    call a still-running process nothing to kill. The handle is the pid the
+    client recorded at spawn, the start id it read for that pid then
+    (:func:`platform_compat.get_process_start_id`, the recycling detector the
+    kill re-reads before it signals), and the child records it had accumulated,
+    snapshotted from the live client while the map still held the session --
+    or, when the run's OWN teardown reset has already popped it, from the session
+    the manager retains for exactly the life of that teardown
+    (``SessionManager.tearing_down``), which is the same client.
+    """
+
+    pid: int | None
+    start_id: str | None
+    child_pids: dict[Any, Any]
+
+
+def _process_handle_of(session: Any) -> _ProcessHandle:
+    """Read the kill handle off a live session's ACP client (no syscalls)."""
+    client = getattr(session.provider, "_client", None)
+    raw_pid = getattr(client, "_pid", None) if client else None
+    raw_start = getattr(client, "_start_time", None) if client else None
+    raw_children = getattr(client, "_child_pids", None) if client else None
+    return _ProcessHandle(
+        pid=raw_pid if isinstance(raw_pid, int) and raw_pid > 1 else None,
+        start_id=raw_start if isinstance(raw_start, str) else None,
+        child_pids=dict(raw_children) if isinstance(raw_children, dict) else {},
+    )
+
+
+def _process_survived(handle: _ProcessHandle) -> bool:
+    """Whether the process ``handle`` names may still be standing after a reset.
+
+    A reset that completed is not proof the process is gone: its own shutdown
+    can fail without raising out of it, and one that answered ``False`` found
+    no session and stopped nothing. So the callers ask the process itself,
+    the way ``_sigkill_session`` will: False only on evidence that it is gone
+    -- no usable pid, no start id readable AND no process behind the pid, a
+    start id that differs from the recorded one (the pid is another process's
+    now), or a pid the platform reports as exited even though its start id
+    still reads back. That last case is Windows: the creation time is read
+    through a query handle, which opens for an EXITED process for as long as
+    any handle to the process object is still held (the transport's, until
+    GC), so identity alone does not say alive there; ``pid_exists`` confirms
+    the exit code. Anything else -- the recorded start id read back on a live
+    pid, or a live pid whose identity cannot be confirmed -- is a process the
+    run still has to answer for, and the kill then decides between the signal
+    and a named failure.
+    """
+    pid = handle.pid
+    if not pid:
+        return False
+    actual_start = platform_compat.get_process_start_id(pid)
+    if actual_start is None:
+        return platform_compat.pid_exists(pid)
+    if handle.start_id is not None and actual_start != handle.start_id:
+        return False  # recycled: another process owns the pid now
+    return platform_compat.pid_exists(pid)
+
+
 @dataclass(eq=False)
 class _RunClaim:
     """One run's claim on its job: every piece of per-run state, in one object.
@@ -2606,14 +2673,27 @@ class CronService:
         # reaper task cancelled at shutdown); the ``Exception`` arm of the
         # handler is a net for a reset failure the inner handlers let through,
         # and today none does: they catch every ``Exception`` the reset raises,
-        # and ``_sigkill_session`` swallows its own failures, a refused pid
-        # included, instead of raising. The failure is carried into the
-        # terminal record below (the run's finally writes none for a taken
-        # run) and re-raised after it, so the sweep still logs it.
+        # and ``_sigkill_session`` raises nothing. What the SIGKILL could not
+        # do it REPORTS instead -- the guard's refusal of the pid, an error
+        # the kill raised, an error ahead of the signal -- as its result, so
+        # a process group it left alive is never recorded as reaped: the
+        # failure, raised or reported, is carried into the terminal record
+        # below (the run's finally writes none for a taken run) and audited as
+        # ``failed``; a raised one is re-raised after the record, so the sweep
+        # still logs it.
         kill_failure: BaseException | None = None
+        sigkill_failure: str | None = None
         try:
             # Kill the session process first.
             if self._sessions:
+                # Taken BEFORE the reset: the reset pops the session from the map
+                # before it can hang, so a kill that looked the key up afterwards
+                # would find nothing and leave the process it names running. A
+                # session the run's OWN teardown reset has already popped is read
+                # from the manager's torn-down table (see
+                # ``_session_process_handle``); only a key with neither has no
+                # process to answer for.
+                handle = self._session_process_handle(session_key)
                 try:
                     await asyncio.wait_for(
                         # Same class as ``cancel``: the reaper has given up on this run, so
@@ -2623,10 +2703,30 @@ class CronService:
                     )
                 except asyncio.TimeoutError:
                     logger.warning("Reaper: reset hung for cron %s, attempting SIGKILL", job_id)
-                    await self._sigkill_session(session_key)
+                    sigkill_failure = await self._sigkill_session(session_key, handle)
                 except Exception:
                     logger.exception("Reaper: reset failed for cron %s, attempting SIGKILL", job_id)
-                    await self._sigkill_session(session_key)
+                    sigkill_failure = await self._sigkill_session(session_key, handle)
+                else:
+                    # A completed reset -- True, or False for a key a concurrent
+                    # reset had already popped -- is not proof the process is
+                    # gone: the reset's own shutdown can fail without raising
+                    # out of it, and a False one stopped nothing at all. The
+                    # common False is the run's OWN teardown reset, popped
+                    # before this reap looked and hung since (the cancel in the
+                    # ``finally`` below is what ends it): its handle came from
+                    # the torn-down table, and the process it holds is asked
+                    # like any other. The handle is asked instead (pid +
+                    # recorded start id); a process still standing gets the
+                    # fallback, and what the fallback reports is what the
+                    # record says. Nothing to verify without a handle: no
+                    # session was live, or being torn down, under the key.
+                    if handle is not None and _process_survived(handle):
+                        logger.warning(
+                            "Reaper: process survived the reset for cron %s, attempting SIGKILL",
+                            job_id,
+                        )
+                        sigkill_failure = await self._sigkill_session(session_key, handle)
         except (Exception, asyncio.CancelledError) as exc:
             # CancelledError too: the reaper task is cancelled at shutdown, and
             # this reap still owes the finish and the record before it lets
@@ -2639,6 +2739,11 @@ class CronService:
             # _run_job_isolated's finally — the reaper exists for cases where the
             # normal path is stuck (idempotent with finally).
             self._finish_taken_claim(job_id)
+        # One name for the record and the audit: a failure that escaped the
+        # kill (re-raised below) or one the SIGKILL reported.
+        kill_failed = (
+            _teardown_failure(kill_failure) if kill_failure is not None else sigkill_failure
+        )
 
         # Update job state and persist. The persist goes through the locked
         # worker-thread merge helper (offloaded via asyncio.to_thread) — NOT a
@@ -2649,8 +2754,8 @@ class CronService:
         job = next((j for j in self._jobs if j.id == job_id), None)
         if job:
             last_error = f"Reaped after {int(elapsed)}s (exceeded {deadline}s deadline)"
-            if kill_failure is not None:
-                last_error += f"; kill failed: {_teardown_failure(kill_failure)}"
+            if kill_failed is not None:
+                last_error += f"; kill failed: {kill_failed}"
             last_run_ts = time.time()
             # Drawn here, in the same loop step as the release above (no await
             # between them), so a replacement claim always draws a higher one
@@ -2699,7 +2804,9 @@ class CronService:
                 session_key=session_key,
                 source="cron",
                 tool_name="reaper_force_kill",
-                outcome="reaped" if kill_failure is None else "failed",
+                # Never ``reaped`` for a process group the kill left alive:
+                # the reap ended the run's record, not its processes.
+                outcome="reaped" if kill_failed is None else "failed",
                 metadata={
                     "job_id": job_id,
                     "session_key": session_key,
@@ -2711,11 +2818,91 @@ class CronService:
         if kill_failure is not None:
             raise kill_failure
 
-    async def _sigkill_session(self, session_key: str) -> None:
+    def _session_process_handle(self, session_key: str) -> _ProcessHandle | None:
+        """The kill handle of the session under ``session_key``, or None if none is live.
+
+        Read BEFORE the reset by ``_force_reap`` and ``cancel`` (see
+        :class:`_ProcessHandle` for why the reset itself loses it).
+
+        A miss in the live map is not yet "no process". The run's OWN teardown
+        reset -- the run body's ``finally`` in the gateway, or the deferred reset
+        a late sub-agent completion triggers -- pops the session out of the map
+        before the awaits that can hang, so a reap or cancel that arrives after
+        that pop finds nothing under the key while that reset still holds the
+        process. That is the ordinary shape of a run that hangs in its teardown,
+        not a timing corner: the reaper's cancel of the run task is what ends the
+        hung reset, and nothing else re-examines the process once the audit is
+        written. The session manager keeps the popped session readable through
+        ``tearing_down`` for exactly the life of its teardown (one entry per key,
+        released when the teardown ends however it ends -- that cancel included),
+        so a live miss falls back to it, and the same survival check, fallback and
+        audit run against that handle. Nothing there either: no session was live
+        under the key, nothing to kill.
+        """
+        if not self._sessions:
+            return None
+        session = self._sessions._sessions.get(session_key)
+        if session is None:
+            tearing_down = getattr(self._sessions, "tearing_down", None)
+            session = tearing_down(session_key) if callable(tearing_down) else None
+        return _process_handle_of(session) if session else None
+
+    async def _sigkill_session(self, session_key: str, handle: _ProcessHandle | None) -> str | None:
         """Best-effort SIGKILL when graceful reset hangs.
 
         Uses killpg to kill the entire process group, then sweeps
         escaped children in different PGIDs (MCP servers).
+
+        ``handle`` is the process handle the caller took before the reset
+        (:meth:`_session_process_handle`), and it is the ONLY thing that names
+        the process. The reset pops the session from the map before it can
+        hang, and a session found under the key afterwards is a successor a
+        cold start registered during the reset's awaits (a sub-agent
+        completion delivering into the key, a queued turn) -- a different
+        process, whose kill would leave the run's own alive while its record
+        said reaped. So the map is never consulted here; ``session_key``
+        names the run in the log only. ``None`` means no session was live, or
+        being torn down, under the key before the reset: nothing to kill.
+
+        The root's start id is read twice against the recorded one: before
+        anything reads through the pid (a fresh child probe of a recycled pid
+        would enlist another process's children) and again immediately
+        before the signal, because the child walk awaits and the process can
+        exit -- and the kernel hand its pid to another process -- while it
+        does. The gap between that second read and the signal is the one a
+        pid-based kill cannot close.
+
+        Returns None once the run's process group has been signalled, and
+        otherwise the failure, named as :func:`_teardown_failure` names one
+        (``"ValueError: kill_process_tree: refusing …"``), for the run's
+        terminal record: the broadcast guard's refusal of the pid, an error
+        the kill raised with no pid-scoped fallback landing (on Windows, any
+        error other than a gone tree: the fallback signals the root alone and
+        nothing sweeps the descendants there), a live pid whose identity could
+        not be confirmed as this run's (no start id recorded, or none readable
+        now), or an error in the kill path ahead of the signal. This never
+        raises -- the caller took the run's claim and must still finish it --
+        but it never swallows either: a process group left alive is the
+        caller's to record, so its audit does not say the run was reaped.
+
+        Nothing to kill is not a failure and also returns None: no pre-reset
+        handle (no session was live, or being torn down, under ``session_key``
+        before the reset),
+        no usable pid on it, a pid whose process has already exited or been
+        recycled by the recorded start id -- at either read (the
+        escaped-children sweep still runs) -- and a group AND pid that are
+        both gone by the time the signal is sent. There is no process group
+        to answer for in any of them.
+
+        The escaped-children sweep is POSIX-only by nature: on Windows
+        ``_direct_children`` returns ``[]`` and ``_kill_escaped_children`` is
+        a no-op, because ``taskkill /T`` walks the tree itself when it can
+        reach the root. So on Windows a root that is already gone leaves no
+        descendant this code can enumerate, verify or signal -- a platform
+        limitation of the child helpers, not a verdict this per-run record
+        can make. What this method DOES report there is the case it has
+        evidence for: a tree kill that raised while the root was alive, whose
+        root-only fallback cannot stand in for the walk.
 
         Async so the Windows ``taskkill`` spawn offloads to
         :func:`kiro_crew.executors.subprocess_executor` via
@@ -2724,35 +2911,77 @@ class CronService:
         ``taskkill.exe``. The child-tree probe helpers
         (``_get_child_pids`` / ``_get_start_time`` / ``_read_basename``) also
         shell out to ``ps`` / ``pgrep`` on macOS, so they are offloaded to the
-        same executor.
+        same executor; the start-id read is in-process on every platform.
         """
         if not self._sessions:
-            return
+            return None  # no session manager: nothing to kill
         try:
             # circular import: cron → acp.client → session → cron
             from kiro_crew.acp.client import (
                 _capture_child_records,
                 _get_child_pids,
-                _is_our_child,
                 _kill_escaped_children,
             )
 
-            session = self._sessions._sessions.get(session_key)
-            if not session:
+            if handle is None:
+                # Nothing to kill, not a failure: no session was live, or being
+                # torn down, under the key before the reset, so the run has no
+                # process group to answer for. Same for a handle with no usable
+                # pid below. The map is deliberately not read: whatever it holds
+                # under the key now was registered after the snapshot -- a
+                # successor, not this run's process.
                 logger.warning("Reaper: no session found for %s", session_key)
-                return
-            client = getattr(session.provider, "_client", None)
-            raw_pid = getattr(client, "_pid", None) if client else None
-            pid = raw_pid if isinstance(raw_pid, int) and raw_pid > 1 else None
+                return None
+            pid = handle.pid
             if not pid:
-                logger.warning("Reaper: no usable PID (%r) for %s", raw_pid, session_key)
-                return
-            # Snapshot child tree before killing — children in different
-            # PGIDs survive killpg. The macOS pgrep/ps spawns happen on the
-            # subprocess_executor so the loop keeps ticking.
+                logger.warning("Reaper: no usable PID for %s", session_key)
+                return None
             loop = asyncio.get_running_loop()
-            raw_children = getattr(client, "_child_pids", None)
-            child_pids: dict = dict(raw_children) if isinstance(raw_children, dict) else {}
+            # The children the client had recorded (start id + basename each):
+            # the escaped-children sweep verifies every one before signalling.
+            child_pids: dict = dict(handle.child_pids)
+            # Validate the root by its recorded start id BEFORE anything else
+            # reads through the pid: a fresh child probe of a recycled pid
+            # would enlist another process's children. The start id is read
+            # the way the client recorded it at spawn
+            # (``platform_compat.get_process_start_id``), in-process.
+            actual_start = platform_compat.get_process_start_id(pid)
+            if actual_start is None and not platform_compat.pid_exists(pid):
+                # Already exited: nothing to kill; the sweep still runs for
+                # children that outlived it (POSIX only -- see the docstring:
+                # on win32 no descendant of a gone root is reachable at all).
+                logger.debug("Reaper: PID %d already dead for %s", pid, session_key)
+                await loop.run_in_executor(
+                    subprocess_executor(), _kill_escaped_children, child_pids
+                )
+                return None
+            if handle.start_id is None or actual_start is None:
+                # A live process whose identity cannot be confirmed as this
+                # run's -- the client recorded no start id, or none is readable
+                # now -- is not signalled (deny-by-default, as the child sweep
+                # does) and is not gone either: the caller records the failure.
+                logger.error(
+                    "Reaper: PID %d is alive but unverified for %s (recorded %r, read %r)",
+                    pid,
+                    session_key,
+                    handle.start_id,
+                    actual_start,
+                )
+                await loop.run_in_executor(
+                    subprocess_executor(), _kill_escaped_children, child_pids
+                )
+                return f"pid {pid} is alive but could not be verified as this run's; not signalled"
+            if actual_start != handle.start_id:
+                # Recycled: the run's process is gone and another owns the pid
+                # now. Nothing to kill; only the recorded children are swept.
+                logger.warning("Reaper: PID %d recycled for %s, skipping killpg", pid, session_key)
+                await loop.run_in_executor(
+                    subprocess_executor(), _kill_escaped_children, child_pids
+                )
+                return None
+            # The root is ours: snapshot its live child tree before killing --
+            # children in different PGIDs survive killpg. The macOS pgrep/ps
+            # spawns happen on the subprocess_executor so the loop keeps ticking.
             fresh = await loop.run_in_executor(subprocess_executor(), _get_child_pids, pid)
             new_pids = [p for p in fresh if p not in child_pids]
             if new_pids:
@@ -2761,21 +2990,25 @@ class CronService:
                         subprocess_executor(), _capture_child_records, new_pids
                     )
                 )
-            # Validate PID hasn't been recycled before killing.
-            original_start = getattr(client, "_start_time", None)
-            if original_start is None:
-                logger.debug("Reaper: PID %d already dead for %s", pid, session_key)
-                await loop.run_in_executor(
-                    subprocess_executor(), _kill_escaped_children, child_pids
+            # The walk above awaited (an executor hop everywhere, ``ps`` /
+            # ``pgrep`` spawns on macOS), and the root can exit -- and the
+            # kernel hand its pid to another process -- while it does; a
+            # ``killpg`` through the pid then would signal that process's
+            # group. Read the start id again immediately before the signal: a
+            # reading that differs is a root that is gone (nothing to kill),
+            # and the fresh records above were read through a pid that is not
+            # this run's any more, so only the children recorded before the
+            # reset are swept.
+            if platform_compat.get_process_start_id(pid) != handle.start_id:
+                logger.warning(
+                    "Reaper: PID %d exited during the child walk for %s, skipping killpg",
+                    pid,
+                    session_key,
                 )
-                return
-            if not await loop.run_in_executor(
-                subprocess_executor(), _is_our_child, pid, original_start
-            ):
-                logger.warning("Reaper: PID %d recycled for %s, skipping killpg", pid, session_key)
-                stored = dict(raw_children) if isinstance(raw_children, dict) else {}
-                await loop.run_in_executor(subprocess_executor(), _kill_escaped_children, stored)
-                return
+                await loop.run_in_executor(
+                    subprocess_executor(), _kill_escaped_children, dict(handle.child_pids)
+                )
+                return None
             # Kill the entire process group first
             logger.warning(
                 "Reaper: killpg for PID %d (%d children) for %s",
@@ -2783,6 +3016,7 @@ class CronService:
                 len(child_pids),
                 session_key,
             )
+            failure: str | None = None
             try:
                 # killpg(getpgid) on POSIX, taskkill /T on Windows — routed
                 # through platform_compat, whose POSIX path carries the
@@ -2791,18 +3025,49 @@ class CronService:
                 # Windows taskkill to subprocess_executor so the reaper loop
                 # never blocks the event loop on taskkill.exe.
                 await platform_compat.kill_process_tree_async(pid, platform_compat.SIGKILL)
-            except ValueError:
+            except ValueError as exc:
                 # Guard refused the pid outright (non-int/reserved) — nothing
-                # safe to signal.
+                # safe to signal, so the group is still alive: report it.
                 logger.error("Reaper: kill guard refused pid %r for %s", pid, session_key)
-            except (ProcessLookupError, OSError):
+                failure = _teardown_failure(exc)
+            except OSError as group_exc:
+                # ProcessLookupError: the group is already gone, nothing to
+                # kill. Any other error (EPERM, a taskkill failure) may have
+                # left the group's members alive, so the pid-scoped fallback
+                # has to land for this kill to count.
+                group_gone = isinstance(group_exc, ProcessLookupError)
                 try:
                     await platform_compat.kill_pid_async(pid, platform_compat.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
+                except ProcessLookupError:
+                    # The pid is gone as well. With the group gone too there
+                    # was nothing left to kill; after any other group error
+                    # the members it could not signal still stand.
+                    if not group_gone:
+                        failure = _teardown_failure(group_exc)
+                except OSError as pid_exc:
+                    failure = _teardown_failure(pid_exc)
+                else:
+                    # The fallback landed on the root. On POSIX the sweep
+                    # below reaches the children the group signal missed, so
+                    # the kill counts. On Windows ``taskkill /T`` was the only
+                    # tree walker: ``kill_pid_async`` is a root-only
+                    # ``taskkill /PID`` and ``_kill_escaped_children`` is a
+                    # no-op there, so the descendants a tree kill that raised
+                    # could not terminate still stand -- still a failure.
+                    if platform_compat.IS_WINDOWS and not group_gone:
+                        failure = _teardown_failure(group_exc)
+                if failure is not None:
+                    logger.error(
+                        "Reaper: SIGKILL of pid %d failed for %s: %s", pid, session_key, failure
+                    )
             await loop.run_in_executor(subprocess_executor(), _kill_escaped_children, child_pids)
-        except Exception:
+            return failure
+        except Exception as exc:
+            # An error ahead of the signal (a child-tree probe, the import,
+            # the executor) or in the escaped-children sweep: the kill did not
+            # happen as intended, and the caller's record has to say so.
             logger.exception("Reaper: SIGKILL failed for %s", session_key)
+            return _teardown_failure(exc)
 
     # ── User-initiated cancellation ──
 
@@ -2860,12 +3125,16 @@ class CronService:
         # interpreter exit -- RuntimeError either way) and a cancellation of
         # this handler when the client disconnects. Step 2 raises nothing but
         # a cancellation: its inner handlers catch every ``Exception`` the
-        # reset raises, and ``_sigkill_session`` swallows its own failures, a
-        # refused pid included. The failure is carried into the terminal
-        # record (the run's finally writes none for a taken run) and re-raised
-        # after it, so the caller still learns the kill failed.
+        # reset raises, and ``_sigkill_session`` raises nothing -- it REPORTS
+        # a refused pid or a failed kill as its result instead, so a process
+        # group it left alive is never recorded as cancelled. The failure,
+        # raised or reported, is carried into the terminal record (the run's
+        # finally writes none for a taken run) and audited as ``failed``; a
+        # raised one is re-raised after the record, so the caller still learns
+        # the kill failed.
         killed_proc = False
         kill_failure: BaseException | None = None
+        sigkill_failure: str | None = None
         try:
             # 1. Script/command crons: SIGTERM the sandboxed subprocess group.
             # Offloaded: kill_running_process performs blocking kernel calls.
@@ -2875,6 +3144,11 @@ class CronService:
 
             # 2. Agent crons: kill the kiro-cli session (mirrors _force_reap).
             if self._sessions and is_agent_job and not killed_proc:
+                # Before the reset, for the reason ``_force_reap`` gives: the reset
+                # pops the session from the map before it can hang -- and a session
+                # the run's own teardown already popped is read from the manager's
+                # torn-down table.
+                handle = self._session_process_handle(session_key)
                 try:
                     await asyncio.wait_for(
                         # The job is cancelled, so its conversation is over and its
@@ -2884,10 +3158,20 @@ class CronService:
                     )
                 except asyncio.TimeoutError:
                     logger.warning("Cancel: reset hung for cron %s, attempting SIGKILL", job_id)
-                    await self._sigkill_session(session_key)
+                    sigkill_failure = await self._sigkill_session(session_key, handle)
                 except Exception:
                     logger.exception("Cancel: reset failed for cron %s, attempting SIGKILL", job_id)
-                    await self._sigkill_session(session_key)
+                    sigkill_failure = await self._sigkill_session(session_key, handle)
+                else:
+                    # A completed reset (True or False) is not proof the process
+                    # is gone; the handle is asked, and a process still standing
+                    # gets the fallback (see ``_force_reap``).
+                    if handle is not None and _process_survived(handle):
+                        logger.warning(
+                            "Cancel: process survived the reset for cron %s, attempting SIGKILL",
+                            job_id,
+                        )
+                        sigkill_failure = await self._sigkill_session(session_key, handle)
         except (Exception, asyncio.CancelledError) as exc:
             # CancelledError too: aiohttp cancels the route's handler when the
             # client disconnects mid-cancel, and this coroutine still owes the
@@ -2899,6 +3183,11 @@ class CronService:
             # 3. Cancel the asyncio task and release the claim directly
             # (idempotent with _run_job_isolated's finally).
             self._finish_taken_claim(job_id)
+        # One name for the record and the audit: a failure that escaped the
+        # kill (re-raised below) or one the SIGKILL reported.
+        kill_failed = (
+            _teardown_failure(kill_failure) if kill_failure is not None else sigkill_failure
+        )
 
         # 4. Update job state, persist, and record history. The persist goes
         # through the locked worker-thread merge helper (offloaded via
@@ -2907,8 +3196,8 @@ class CronService:
         # worker; the bounded spin never parks this loop-side coroutine.
         if job:
             last_error = f"Cancelled by user after {int(elapsed)}s"
-            if kill_failure is not None:
-                last_error += f"; kill failed: {_teardown_failure(kill_failure)}"
+            if kill_failed is not None:
+                last_error += f"; kill failed: {kill_failed}"
             last_run_ts = time.time()
             # Drawn here, in the same loop step as the release in step 3 (no
             # await between them), so a replacement claim always draws a higher
@@ -2955,7 +3244,8 @@ class CronService:
                 session_key=session_key,
                 source="cron",
                 tool_name="cron_cancel",
-                outcome="cancelled" if kill_failure is None else "failed",
+                # Never ``cancelled`` for a process group the kill left alive.
+                outcome="cancelled" if kill_failed is None else "failed",
                 metadata={
                     "job_id": job_id,
                     "session_key": session_key,

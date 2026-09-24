@@ -455,7 +455,7 @@ class TestAnAbortedTeardownStillFinishesItsClaim:
         svc, job, claim, task = _cancel_fixture(tmp_path)
         svc._sessions.reset = AsyncMock(side_effect=RuntimeError("reset failed"))
 
-        async def _sigkill_raises(_session_key: str) -> None:
+        async def _sigkill_raises(_session_key: str, _handle: object = None) -> None:
             raise OSError("killpg refused")
 
         with (

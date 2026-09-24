@@ -1960,6 +1960,119 @@ class TestRelease:
         await mgr.close_all()
 
 
+class TestResetRetainsTheTornDownSession:
+    """``reset`` keeps the popped session readable for exactly the life of its teardown.
+
+    The pop happens under the registry lock before the awaits that can hang, so
+    from then on the live map does not name the process the teardown holds. A
+    reader that must still reach it -- the cron reaper, after a run's own finally
+    reset popped the session and hung -- reads ``tearing_down(key)``. The entry is
+    recorded at the pop and released when the reset ends, however it ends.
+    """
+
+    @staticmethod
+    def _hang_shutdown(provider):
+        gate = asyncio.Event()
+
+        async def _hung():
+            await gate.wait()
+
+        provider.shutdown = AsyncMock(side_effect=_hung)
+        return gate
+
+    @staticmethod
+    async def _until_the_shutdown_hangs(mgr, key, provider):
+        """Wait until the teardown has popped the session and entered the hung shutdown.
+
+        The cancel below has to land IN the shutdown: a cancellation that lands one
+        await earlier, at ``record_session_ended``'s crumb hop, is absorbed by
+        design (the pop is the point of no return, so the teardown runs on) -- and a
+        teardown that runs on into a hung shutdown keeps its entry, correctly.
+        """
+        for _ in range(400):
+            if not mgr.has_session(key) and provider.shutdown.await_count:
+                return
+            await asyncio.sleep(0.005)
+        raise AssertionError(f"the teardown of {key} never reached the provider shutdown")
+
+    @pytest.mark.asyncio
+    async def test_the_popped_session_is_readable_while_its_teardown_runs_and_gone_after(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        assert mgr.tearing_down("k1") is None, "no teardown is in flight yet"
+        self._hang_shutdown(provider)
+
+        teardown = asyncio.create_task(mgr.reset("k1"))
+        await self._until_the_shutdown_hangs(mgr, "k1", provider)
+
+        torn = mgr.tearing_down("k1")
+        assert torn is not None and torn.provider is provider
+        assert not mgr.has_session("k1")
+
+        # The teardown is cancelled out from under its hung shutdown (the reaper's
+        # cancel of a run task lands exactly here): the entry goes with it.
+        teardown.cancel()
+        await asyncio.gather(teardown, return_exceptions=True)
+        assert mgr.tearing_down("k1") is None
+
+    @pytest.mark.asyncio
+    async def test_a_completed_reset_leaves_no_entry(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+
+        assert await mgr.reset("k1") is True
+
+        provider.shutdown.assert_awaited_once()
+        assert mgr.tearing_down("k1") is None
+
+    @pytest.mark.asyncio
+    async def test_a_reset_whose_shutdown_raises_still_releases_the_entry(self, cfg):
+        """``reset`` defers a shutdown error to its end and re-raises it; the entry is gone by then."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        provider.shutdown = AsyncMock(side_effect=RuntimeError("shutdown failed"))
+
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            await mgr.reset("k1")
+
+        assert mgr.tearing_down("k1") is None
+
+    @pytest.mark.asyncio
+    async def test_a_successor_popped_during_the_teardown_does_not_replace_the_entry(self, cfg):
+        """First popper wins: the entry names the process the hung teardown holds, not a successor's.
+
+        A cold start can register a successor under the key while the first
+        teardown awaits; resetting that successor records nothing (one entry per
+        key) and its completion releases nothing it did not record, so a reader
+        asking after the run's process still gets the popped one until that
+        teardown ends.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        first, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        self._hang_shutdown(first)
+        teardown = asyncio.create_task(mgr.reset("k1"))
+        await self._until_the_shutdown_hangs(mgr, "k1", first)
+
+        successor, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        assert successor is not first
+        assert await mgr.reset("k1") is True
+
+        successor.shutdown.assert_awaited_once()
+        torn = mgr.tearing_down("k1")
+        assert (
+            torn is not None and torn.provider is first
+        ), "the successor's reset replaced the entry"
+
+        teardown.cancel()
+        await asyncio.gather(teardown, return_exceptions=True)
+        assert mgr.tearing_down("k1") is None
+
+
 class TestResetWithPid:
     """Tests for reset() PID capture and force-kill logic."""
 

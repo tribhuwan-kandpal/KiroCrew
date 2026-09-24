@@ -7,6 +7,7 @@ run_command_sandboxed, and the POST /api/crons/{id}/cancel handler.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,6 +16,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew import platform_compat
 from kiro_crew.cron import CronJob, CronSchedule, CronService, _RunClaim
 from kiro_crew.cron_history import CronHistoryStore
 from kiro_crew.cron_script import (
@@ -30,6 +32,9 @@ def _mock_sessions() -> MagicMock:
     sessions = MagicMock()
     sessions.reset = AsyncMock()
     sessions._sessions = {}
+    # No teardown in flight (``SessionManager.tearing_down``): a live-map miss is
+    # a key with no process.
+    sessions.tearing_down = MagicMock(return_value=None)
     return sessions
 
 
@@ -144,6 +149,206 @@ class TestCronServiceCancel:
         assert job.enabled is True
 
     @pytest.mark.asyncio
+    async def test_cancel_records_a_refused_sigkill_as_a_failed_kill(
+        self, tmp_path: object
+    ) -> None:
+        """Same helper as the reaper: a kill it reports as refused is a failure here too.
+
+        The cancel still finishes -- claim released, task cancelled, terminal
+        row written, ``True`` answered -- but its record carries the failure
+        and its audit says ``failed``, not ``cancelled``, because the run's
+        process group is still alive.
+        """
+        svc = CronService(base_dir=None, on_job=AsyncMock())
+        svc._history = CronHistoryStore(base_dir=tmp_path)
+        svc._sessions = _mock_sessions()
+        svc._sessions.reset = AsyncMock(side_effect=RuntimeError("reset failed"))
+        client = MagicMock()
+        client._pid = 5151
+        client._child_pids = {}
+        client._start_time = "4821903"
+        session = MagicMock()
+        session.provider._client = client
+        svc._sessions._sessions["cron:refused"] = session
+
+        job = _make_job("refused")
+        svc._jobs = [job]
+        task = MagicMock(done=MagicMock(return_value=False))
+        claim = svc._claims["refused"] = _RunClaim(
+            trigger="manual", claimed_at=time.time() - 42, task=task
+        )
+
+        with (
+            patch("kiro_crew.sel.sel") as mock_sel,
+            patch.object(svc, "_save"),
+            patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value="4821903"),
+            patch("kiro_crew.acp.client._kill_escaped_children"),
+            patch(
+                "kiro_crew.platform_compat.kill_process_tree_async",
+                AsyncMock(
+                    side_effect=ValueError("kill_process_tree: refusing non-int/reserved pid 5151")
+                ),
+            ),
+        ):
+            assert await svc.cancel("refused") is True
+
+        assert "refused" not in svc._claims
+        task.cancel.assert_called_once()
+        assert svc._cancelled_jobs.has("refused", claim)
+        assert (job.last_error or "").startswith("Cancelled by user after")
+        assert "; kill failed: ValueError: kill_process_tree: refusing" in (job.last_error or "")
+        runs, total = await svc._history.get_job_history("refused")
+        assert total == 1 and runs[0]["status"] == "cancelled"
+        assert "; kill failed: " in runs[0]["error"]
+        audit = mock_sel().log_tool_invocation.call_args.kwargs
+        assert audit["tool_name"] == "cron_cancel"
+        assert (
+            audit["outcome"] == "failed"
+        ), "the SEL audit says the run was cancelled while its process group is still alive"
+
+    @pytest.mark.asyncio
+    async def test_cancel_kills_the_process_a_hung_reset_had_already_unmapped(
+        self, tmp_path: object
+    ) -> None:
+        """The reset pops the session before it can hang; cancel takes its kill handle first."""
+        svc = CronService(base_dir=None, on_job=AsyncMock())
+        svc._history = CronHistoryStore(base_dir=tmp_path)
+        svc._sessions = _mock_sessions()
+
+        async def _pop_then_hang(session_key: str, **_: object) -> bool:
+            svc._sessions._sessions.pop(session_key, None)
+            raise asyncio.TimeoutError
+
+        svc._sessions.reset = AsyncMock(side_effect=_pop_then_hang)
+        client = MagicMock()
+        client._pid = 5252
+        client._child_pids = {}
+        client._start_time = "4821903"
+        session = MagicMock()
+        session.provider._client = client
+        svc._sessions._sessions["cron:popped"] = session
+        job = _make_job("popped")
+        svc._jobs = [job]
+        claim = svc._claims["popped"] = _RunClaim(
+            trigger="manual", claimed_at=time.time() - 42, task=MagicMock(done=MagicMock(return_value=False))
+        )
+
+        with (
+            patch("kiro_crew.sel.sel") as mock_sel,
+            patch.object(svc, "_save"),
+            patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value="4821903"),
+            patch("kiro_crew.acp.client._kill_escaped_children"),
+            patch(
+                "kiro_crew.platform_compat.kill_process_tree_async", AsyncMock(return_value=True)
+            ) as tree_kill,
+        ):
+            assert await svc.cancel("popped") is True
+
+        assert "cron:popped" not in svc._sessions._sessions, "the fixture did not pop the session"
+        tree_kill.assert_awaited_once_with(5252, platform_compat.SIGKILL)
+        assert svc._cancelled_jobs.has("popped", claim)
+        assert "kill failed" not in (job.last_error or "")
+        assert mock_sel().log_tool_invocation.call_args.kwargs["outcome"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_cancel_kills_a_process_that_survived_a_completed_reset(
+        self, tmp_path: object
+    ) -> None:
+        """A reset that returned (True, or False for an already-popped key) is not proof of death.
+
+        Mirrors ``_force_reap``: after every completed reset the pre-reset handle
+        is asked -- pid plus recorded start id -- and a process still standing
+        gets the fallback, so cancel never records a cancellation it did not
+        deliver on the strength of the reset's boolean.
+        """
+        svc = CronService(base_dir=None, on_job=AsyncMock())
+        svc._history = CronHistoryStore(base_dir=tmp_path)
+        svc._sessions = _mock_sessions()
+        svc._sessions.reset = AsyncMock(return_value=True)
+        client = MagicMock()
+        client._pid = 5353
+        client._child_pids = {}
+        client._start_time = "4821903"
+        session = MagicMock()
+        session.provider._client = client
+        svc._sessions._sessions["cron:survived"] = session
+        job = _make_job("survived")
+        svc._jobs = [job]
+        svc._claims["survived"] = _RunClaim(
+            trigger="manual", claimed_at=time.time() - 42, task=MagicMock(done=MagicMock(return_value=False))
+        )
+
+        with (
+            patch("kiro_crew.sel.sel") as mock_sel,
+            patch.object(svc, "_save"),
+            patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value="4821903"),
+            # Liveness is read after identity (see ``_process_survived``); pinned so
+            # the verdict does not depend on what the host runs under a made-up pid.
+            patch("kiro_crew.platform_compat.pid_exists", return_value=True),
+            patch("kiro_crew.acp.client._kill_escaped_children"),
+            patch(
+                "kiro_crew.platform_compat.kill_process_tree_async", AsyncMock(return_value=True)
+            ) as tree_kill,
+        ):
+            assert await svc.cancel("survived") is True
+
+        tree_kill.assert_awaited_once_with(5353, platform_compat.SIGKILL)
+        assert "kill failed" not in (job.last_error or "")
+        assert mock_sel().log_tool_invocation.call_args.kwargs["outcome"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_cancel_kills_the_process_of_a_session_the_run_s_own_teardown_popped(
+        self, tmp_path: object
+    ) -> None:
+        """The run's own finally reset popped the session BEFORE cancel looked; the kill still lands.
+
+        Same lookup as ``_force_reap``: the live map misses, the session manager
+        still holds the popped session for the life of its (hung) teardown, and
+        the handle read from there names the process. Without it cancel's own
+        reset answered False for the gone key, nothing was verified, and the run
+        was recorded ``cancelled`` with its process untouched.
+        """
+        svc = CronService(base_dir=None, on_job=AsyncMock())
+        svc._history = CronHistoryStore(base_dir=tmp_path)
+        svc._sessions = _mock_sessions()
+        svc._sessions.reset = AsyncMock(return_value=False)
+        client = MagicMock()
+        client._pid = 5454
+        client._child_pids = {}
+        client._start_time = "4821903"
+        torn = MagicMock()
+        torn.provider._client = client
+        # Out of the live map, in the torn-down table.
+        svc._sessions.tearing_down = MagicMock(
+            side_effect=lambda key: torn if key == "cron:torn" else None
+        )
+        job = _make_job("torn")
+        svc._jobs = [job]
+        svc._claims["torn"] = _RunClaim(
+            trigger="manual", claimed_at=time.time() - 42, task=MagicMock(done=MagicMock(return_value=False))
+        )
+
+        with (
+            patch("kiro_crew.sel.sel") as mock_sel,
+            patch.object(svc, "_save"),
+            patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value="4821903"),
+            patch("kiro_crew.platform_compat.pid_exists", return_value=True),
+            patch("kiro_crew.acp.client._kill_escaped_children"),
+            patch(
+                "kiro_crew.platform_compat.kill_process_tree_async", AsyncMock(return_value=True)
+            ) as tree_kill,
+        ):
+            assert await svc.cancel("torn") is True
+
+        tree_kill.assert_awaited_once_with(5454, platform_compat.SIGKILL)
+        assert "kill failed" not in (job.last_error or "")
+        assert mock_sel().log_tool_invocation.call_args.kwargs["outcome"] == "cancelled"
+
+    @pytest.mark.asyncio
     async def test_run_job_isolated_skips_history_when_cancelled(
         self, tmp_path: object
     ) -> None:
@@ -170,25 +375,27 @@ class TestSubprocessRegistry:
     @pytest.mark.asyncio
     async def test_sigkill_session_guard_refusal_still_kills_pid(self):
         """Reaper: when the broadcast guard refuses the pgid, the runaway
-        process must still be reaped via a scoped os.kill (never killpg)."""
+        process must still be reaped via a scoped os.kill (never killpg),
+        and that scoped kill counts as delivered (no failure reported)."""
         svc = CronService(base_dir=None, on_job=AsyncMock())
         client = MagicMock()
         client._pid = 2**22 + 777  # valid int pid
         client._child_pids = {}
-        client._start_time = 12345.0
+        client._start_time = "12345"
         session = MagicMock()
         session.provider._client = client
         sessions = MagicMock()
         sessions._sessions = {"cron:guard": session}
         svc._sessions = sessions
+        handle = svc._session_process_handle("cron:guard")
 
         with patch("kiro_crew.acp.client._get_child_pids", return_value=[]), \
-             patch("kiro_crew.acp.client._is_our_child", return_value=True), \
+             patch("kiro_crew.platform_compat.get_process_start_id", return_value="12345"), \
              patch("kiro_crew.acp.client._kill_escaped_children"), \
              patch("os.getpgid", return_value=1), \
              patch("os.killpg") as mock_killpg, \
              patch("os.kill") as mock_kill:
-            await svc._sigkill_session("cron:guard")
+            assert await svc._sigkill_session("cron:guard", handle) is None
 
         mock_killpg.assert_not_called()
         mock_kill.assert_called_once()

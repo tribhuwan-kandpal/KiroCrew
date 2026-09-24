@@ -2419,16 +2419,34 @@ class SessionManager:
         clear_conversation: bool = False,
         ends_conversation: bool = False,
     ) -> bool:
-        """Reset a live session while preserving its persistence entry."""
-        return await self._lifecycle_boundary().reset(
-            key,
-            expect_session=cast(Any, expect_session),
-            skip_if_busy=skip_if_busy,
-            skip_if_injecting=skip_if_injecting,
-            refuse_only_on_active_turn=refuse_only_on_active_turn,
-            clear_conversation=clear_conversation,
-            ends_conversation=ends_conversation,
-        )
+        """Reset a live session while preserving its persistence entry.
+
+        The session the reset pops stays readable through :meth:`tearing_down`
+        for exactly the life of its teardown: the scope opened here records it at
+        the pop and releases it when the call ends, however it ends.
+        """
+        lifecycle = self._lifecycle_boundary()
+        with lifecycle.teardown_scope() as scope:
+            return await lifecycle.reset(
+                key,
+                expect_session=cast(Any, expect_session),
+                skip_if_busy=skip_if_busy,
+                skip_if_injecting=skip_if_injecting,
+                refuse_only_on_active_turn=refuse_only_on_active_turn,
+                clear_conversation=clear_conversation,
+                ends_conversation=ends_conversation,
+                scope=scope,
+            )
+
+    def tearing_down(self, key: str) -> "_Session | None":
+        """The session ``reset`` popped under *key* whose teardown is still in flight, else None.
+
+        The live map stops naming a session at the pop, before the teardown's
+        awaits; a caller that must still reach that session's process -- the cron
+        reaper, after a run's own finally reset popped the session and hung --
+        reads it here for exactly the life of the teardown.
+        """
+        return cast("_Session | None", self._lifecycle_boundary().tearing_down(key))
 
     def check_context_usage(self, key: str, provider: LLMProvider) -> float:
         """Delegate context accounting and compaction triggering."""

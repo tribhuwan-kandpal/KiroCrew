@@ -380,6 +380,37 @@ class TestCronService:
 
         assert [j.name for j in CronService(base_dir=tmp_path).list_jobs()] == ["first"]
 
+    def test_save_fsyncs_the_cron_store_and_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A successful save is durable across an immediate host restart."""
+        import kiro_crew.atomic_write as atomic_write_module
+
+        real_atomic_write = atomic_write_module.atomic_write
+        real_fsync_dir = atomic_write_module.fsync_dir
+        observed: dict[str, object] = {}
+        calls: list[str] = []
+
+        def recording_atomic_write(path: Path, content: str, **kwargs: object) -> None:
+            calls.append("atomic_write")
+            observed.update(kwargs)
+            real_atomic_write(path, content, **kwargs)
+
+        def recording_fsync_dir(path: Path | str) -> None:
+            calls.append("fsync_dir")
+            observed["fsync_dir"] = Path(path)
+            real_fsync_dir(path)
+
+        monkeypatch.setattr(atomic_write_module, "atomic_write", recording_atomic_write)
+        monkeypatch.setattr(atomic_write_module, "fsync_dir", recording_fsync_dir)
+
+        svc = CronService(base_dir=tmp_path)
+        svc.add_job(name="durable", message="m", every_secs=300)
+
+        assert observed["fsync"] is True
+        assert observed["fsync_dir"] == tmp_path
+        assert calls == ["atomic_write", "fsync_dir"]
+
     def test_a_repaired_store_becomes_writable_again(self, tmp_path: Path) -> None:
         """NC2, third half. The refusal must not latch.
 

@@ -39,6 +39,7 @@ from kiro_crew.agent_discovery import list_agents
 from kiro_crew.config import live
 from kiro_crew.config.loader import ACTIVATION_MENTION, ACTIVATION_OFF
 from kiro_crew.config.sections import _clamp_pct
+from kiro_crew.constants import DENY_CAUSE_APPROVAL_TIMEOUT
 from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import mint_row_mid
@@ -104,6 +105,7 @@ from kiro_crew.messaging.session_resume import (
     refused_resume_is_restricted,
 )
 from kiro_crew.messaging.session_trust import add_trusted_session, is_session_trusted
+from kiro_crew.messaging.spawn_approval_delivery import unpressed_wait_answer
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.messaging.upload_gate import (
     session_blocks_reads,
@@ -3227,9 +3229,14 @@ class TelegramDispatcher:
         generation, so the recomputed key does not match the armed one, the press
         resolves nothing, and the prompt deny-by-defaults at the timeout (the user
         sees "already expired"). This mirrors how a mid-run tool prompt behaves
-        across a rotation. An elapsed wait is a DENY and NOT a fall-through: the
-        prompt was surfaced, so ``False`` is a real decision and the gate refuses
-        the spawn on it rather than re-offering it on Slack/dashboard.
+        across a rotation. An elapsed wait on a channel that is still permitted is
+        a DENY and NOT a fall-through: the prompt was surfaced, so ``False`` is a
+        real decision and the gate refuses the spawn on it. An elapsed wait once
+        the ``channels`` ceiling denies this channel is a fall-through instead,
+        because the callback path drops every press but an explicit reject from
+        that moment on, leaving the prompt unanswerable here; that reading belongs
+        to the seam (``unpressed_wait_answer``), which owns the ceiling for every
+        channel.
         """
         client = self.client
         if client is None:
@@ -3295,7 +3302,17 @@ class TelegramDispatcher:
 
         decider = TelegramApprovalDecider(session_key=session_key)
         event = SimpleNamespace(request_id=rid)
-        return bool(await decider(event))
+        approved = bool(await decider(event))
+        if not approved and decider.last_deny_cause == DENY_CAUSE_APPROVAL_TIMEOUT:
+            # Nobody pressed. Whether an elapsed wait is a deny-by-default or a
+            # fall-through depends on the channels ceiling, which is the seam's to
+            # read: a deny that landed while this prompt was pending makes it
+            # unanswerable here, so reporting ``False`` would refuse the spawn in
+            # the operator's name. A press — approve, trust, or an explicit reject,
+            # which the callback path exempts from a denied channel's drop — is the
+            # operator's own decision and is returned verbatim below.
+            return await unpressed_wait_answer("telegram", rid)
+        return approved
 
     def _spawn_prompt_destination_permitted(self, chat_id: int, thread_id: int | None) -> bool:
         """May a spawn-approval prompt be posted into this chat RIGHT NOW? Fails closed.

@@ -314,6 +314,7 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
         return []
     # Local import: session_control reaches this module through state, so taking
     # the key at module level would close an import cycle.
+    from kiro_crew.dashboard.channel_busy import CHANNEL_ORIGIN_META_KEY
     from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY
     from kiro_crew.dashboard.session_control import (
         QUEUED_CONTAINMENT_META_KEY,
@@ -397,6 +398,16 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
             # itself still survives -- which is what putting the stamp in
             # ``meta`` rather than a consumption callback buys, since a
             # callback-carrying entry is not persisted at all.
+            #
+            # The CHANNEL CONVERSATION stamp (``channel_busy``) goes for the
+            # same reason and names a write target of the same kind: the drain
+            # resolves the recipient of its channel drop notice from this key
+            # alone and sends to whatever allow-listed conversation it names,
+            # from a slot that need never have been bound to it. Nothing in the
+            # entry can attest to the binding, so the key is worth what the file
+            # is worth. The cost is the same one notice, and the entry drains as
+            # an unstamped one: not a channel hand-off any more, so a released
+            # binding neither drops it nor reports it.
             entry["meta"] = {
                 k: v
                 for k, v in meta.items()
@@ -405,6 +416,7 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
                     QUEUED_CONTAINMENT_META_KEY,
                     TURN_ACTOR_META_KEY,
                     SEND_ORIGIN_META_KEY,
+                    CHANNEL_ORIGIN_META_KEY,
                 )
             }
         try:

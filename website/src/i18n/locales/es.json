@@ -8633,7 +8633,12 @@
       "ask_agent_history": "Preguntar al agente sobre el historial"
     },
     "workspaceTree": {
-      "status_failed": "No se pudo leer el estado del repositorio."
+      "status_failed": "No se pudo leer el estado del repositorio.",
+      "row_empty": "Carpeta vacía",
+      "row_hidden_only": "Contenido no mostrado en esta lista",
+      "row_truncated": "Archivos no mostrados: límite de 10.000 archivos alcanzado",
+      "row_unreadable": "No se puede leer la carpeta",
+      "root_unreadable": "No se pudo leer la carpeta {{path}}"
     },
     "skillsMultiSelect": {
       "add_skill": "Add skill",
@@ -9967,8 +9972,8 @@
         "waiting_to_start_queued_behind_the_concurrency_l": "esperando para iniciar — en cola por el límite de concurrencia",
         "workflows": "Flujos de trabajo",
         "workspace_empty": "Este espacio de trabajo aún no tiene archivos",
-        "workspace_truncated": "Espacio de trabajo grande: se muestran hasta 10.000 archivos; todas las carpetas siguen disponibles",
-        "workspace_directory_truncated": "archivos ocultos",
+        "workspace_truncated": "Espacio de trabajo grande: límite de 10.000 archivos alcanzado, algunos archivos no se muestran; todas las carpetas siguen disponibles",
+        "workspace_directory_truncated": "archivos no mostrados",
         "output_load_failed": "No se pudo cargar la salida",
         "retry": "Reintentar",
         "cancel_failed": "No se pudo cancelar el subagente",

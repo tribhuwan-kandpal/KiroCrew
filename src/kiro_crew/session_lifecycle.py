@@ -941,7 +941,53 @@ class SessionLifecycleService:
                 shutdown_error = exc
             platform_compat = self._deps.get_platform_compat()
             if pid:
-                if platform_compat.pid_exists(pid):
+                # A process another LIVE session is still bound to is not a
+                # survivor to reap. A refcounted chat runtime outlives this
+                # session's shutdown by design -- its co-tenants hold it, and
+                # whichever session leaves last kills it -- so SIGKILLing a pid
+                # merely because it outlived one shutdown would end every other
+                # session on it mid-turn, and the child sweep would take the MCP
+                # servers they are using with it.
+                #
+                # Two sources, unioned, because neither sees the whole picture.
+                # The live session table covers a process shared for any reason,
+                # including reasons this feature knows nothing about -- but a
+                # session appears in it only once ``provider.start`` RETURNS,
+                # while a joining session takes its pool lease INSIDE start. So
+                # for the length of a cold start the table shows no survivor and
+                # this guard would kill a runtime a joiner is already holding.
+                # The pool's own lease count closes exactly that window, and is
+                # asked through ``kiro_crew.agent_sdk`` because application code
+                # must not import the agent-backend layer.
+                shared_with_others = False
+                for other_key, other in list(self._owner._sessions.items()):
+                    if other_key == key or other is session:
+                        continue
+                    other_client = getattr(other.provider, "_client", None)
+                    other_pid = getattr(other_client, "_pid", None) if other_client else None
+                    if isinstance(other_pid, int) and other_pid == pid:
+                        shared_with_others = True
+                        break
+                if not shared_with_others:
+                    try:
+                        from kiro_crew.agent_sdk import chat_runtime_pid_has_tenants
+
+                        shared_with_others = chat_runtime_pid_has_tenants(pid)
+                    except Exception:
+                        logger.debug(
+                            "Reset %s: pooled tenancy for PID %s unreadable",
+                            key,
+                            pid,
+                            exc_info=True,
+                        )
+                if shared_with_others:
+                    logger.info(
+                        "Reset %s: PID %d still serves other live sessions; leaving it and "
+                        "its children alone",
+                        key,
+                        pid,
+                    )
+                elif platform_compat.pid_exists(pid):
                     logger.warning("Reset %s: PID %d survived shutdown, force-killing", key, pid)
                     try:
                         await platform_compat.kill_process_tree_async(
@@ -953,7 +999,7 @@ class SessionLifecycleService:
                             await platform_compat.kill_pid_async(pid, platform_compat.SIGKILL)
                         except (ProcessLookupError, OSError):
                             pass
-                if child_pids:
+                if child_pids and not shared_with_others:
                     try:
                         sweep_loop = asyncio.get_running_loop()
                         await sweep_loop.run_in_executor(

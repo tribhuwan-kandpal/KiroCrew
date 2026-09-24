@@ -593,3 +593,15 @@ def skill_view_sidecar_dirs() -> tuple[str, str]:
     )
 
     return (_PROJECTION_METADATA_DIR_NAME, _PROJECTION_LEASE_DIR_NAME)
+
+
+def chat_runtime_pid_has_tenants(pid: int) -> bool:
+    """Whether a pooled chat runtime on *pid* still has tenants holding it.
+
+    The application layer must not import the runtime pool, so the reset path
+    asks through here. False whenever the pool holds nothing live on that pid,
+    which is also the answer when chat runtime sharing is off.
+    """
+    from kiro_crew.acp.chat_runtime_pool import CHAT_RUNTIME_POOL
+
+    return CHAT_RUNTIME_POOL.pid_has_outstanding_leases(pid)

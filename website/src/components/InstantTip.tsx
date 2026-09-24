@@ -65,7 +65,12 @@ export function useInstantTip() {
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null }
   }
   const showFor = (el: HTMLElement) => {
-    const r = el.getBoundingClientRect()
+    // The FIRST line fragment, not the bounding box. An inline anchor that
+    // wraps — a long inline-code chip — has a bounding box whose top-left
+    // corner belongs to no fragment: the top of line one at the left edge of
+    // line two, so a bubble placed there floats over unrelated text. For a
+    // block anchor, or an inline one on a single line, the two rects are equal.
+    const r = el.getClientRects()[0] ?? el.getBoundingClientRect()
     // Lift above the nearest [data-tip-boundary] ancestor, when one exists.
     // In a wrapped chip row the anchor can sit in row 2+, and a bubble opening
     // just above IT covers the row above — the exact chips the user is

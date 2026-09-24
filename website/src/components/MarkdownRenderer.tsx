@@ -51,6 +51,7 @@ import { urlTransform, ALLOWED_PROTOCOLS, WINDOWS_ABS_PATH_RE, decodeLocalPath }
 import { safeHttpUrl } from '../lib/safeUrl'
 import { useLinkMeta, type LinkMeta } from '../lib/linkMeta'
 import { LinkChip, LinkCard } from './LinkPreview'
+import { InstantTip, useInstantTip } from './InstantTip'
 import { parseSourceLinkUrl, forgeChipLabel, type PullRequestLink } from '../utils/pullRequestLinks'
 import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import { JiraHostsCtx } from '../lib/jiraHosts'
@@ -1514,7 +1515,21 @@ function activatePath(
   else actions.onFileOpen(path)
 }
 
-const CHIP_BASE = 'bg-bg-elevated px-1.5 py-0.5 rounded text-accent text-sm font-mono'
+/** What every inline-code chip shares: the geometry and the mono face that make
+ *  a span read as CODE. Deliberately no text colour and no hover underline —
+ *  those are the parts that tell a reader what a click will do, so each chip
+ *  class adds its own (`CHIP_ACTIONABLE` below, or the plain code look of
+ *  `CopyableCode`). One constant carried both for a long time, which dressed
+ *  every copy chip as a link: readers clicked expecting navigation and got a
+ *  silent clipboard write. */
+const CHIP_BASE = 'bg-bg-elevated px-1.5 py-0.5 rounded text-sm font-mono'
+
+/** The look of a chip whose click NAVIGATES or OPENS something — a confirmed
+ *  path, a session, an autolinked work item: the accent colour and the hover
+ *  underline that links wear, the pointer hand, and (at each call site) a
+ *  leading glyph. A chip that only copies must NOT use this: looking like a
+ *  link is a promise to go somewhere. */
+const CHIP_ACTIONABLE = `${CHIP_BASE} text-accent cursor-pointer hover:underline`
 
 /** Geometry of a path chip's leading glyph, shared by the confirmed chip and by
  *  the reserve that stands in for it while the path is unconfirmed.
@@ -1587,20 +1602,26 @@ function revealHintFor(isDir: boolean, platform: GatewayPlatform, directLocal: b
   return i18nT('components.markdownRenderer.click_to_open_shift_click_to_show_in_file_manager')
 }
 
-/** Click-to-copy inline code chip for non-path spans (commands, env vars, IDs).
- *  Uses a brief "copied" feedback state and stays a plain inline `<code>` to
- *  preserve line-wrapping. The copied state shows a small check icon inline;
- *  the icon is `pointer-events-none` and purely decorative so it cannot steal
- *  the click or affect layout reflow. */
 /**
  * The 1.5s "Copied!" acknowledgment, shared by every chip that copies.
  *
- * One definition so the two chips cannot drift on how long it lasts or whether it
+ * One definition so the chips cannot drift on how long it lasts or whether it
  * appears at all — the session chip advertises Ctrl+click in its tooltip, so the
  * gesture owes the same confirmation the click-to-copy chip gives.
+ *
+ * `copy` is the ONLY write path: it writes, and flashes only when
+ * `copyToClipboard` resolves true, per that helper's contract — a tick over an
+ * unchanged clipboard is worse than no cue at all. A refused write sets
+ * `failed` instead, which the caller renders through `CopyFailedNotice`. The
+ * two outcomes are deliberately asymmetric: the confirmation clears itself,
+ * because a confirmation already read is noise; the failure persists until it
+ * is dismissed or a later press succeeds, because a failure that erased itself
+ * could not be read — and it is the outcome the user most needs, because the
+ * text they asked for is NOT on their clipboard.
  */
-function useCopiedFlash(): { copied: boolean; flash: () => void } {
+function useCopiedFlash(): { copied: boolean; failed: boolean; copy: (text: string) => void; dismissFailure: () => void } {
   const [copied, setCopied] = useState(false)
+  const [failed, setFailed] = useState(false)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current) }, [])
   const flash = () => {
@@ -1608,38 +1629,110 @@ function useCopiedFlash(): { copied: boolean; flash: () => void } {
     if (timerRef.current) clearTimeout(timerRef.current)
     timerRef.current = setTimeout(() => setCopied(false), 1500)
   }
-  return { copied, flash }
+  const copy = (text: string) => {
+    void copyToClipboard(text).then(ok => {
+      setFailed(!ok)
+      if (ok) flash()
+    })
+  }
+  return { copied, failed, copy, dismissFailure: () => setFailed(false) }
 }
 
+/**
+ * The refused-clipboard-write notice an inline chip renders beside itself.
+ *
+ * One component so the chips cannot drift on the surface (`ErrorNotice`, the
+ * rule `errors-use-error-notice` requires), the wording, or the hand-off
+ * decision. No hand-off, for the same reason as the table copy notice: this
+ * renderer is embedded in hosts holding unsaved drafts it cannot identify --
+ * MarkdownPanel's editable preview, the chat composer -- so navigating to the
+ * chat could discard what the user typed. Dismissable: one refused write must
+ * not leave a permanent red line in the transcript.
+ */
+function CopyFailedNotice({ onDismiss }: { onDismiss: () => void }) {
+  return (
+    <ErrorNotice
+      variant="inline"
+      className="ml-1.5 align-baseline"
+      message={i18nT('components.markdownRenderer.copy_failed')}
+      onDismiss={onDismiss}
+      testId="md-chip-copy-error"
+    />
+  )
+}
+
+/**
+ * Click-to-copy inline code chip for a span that names nothing the dashboard
+ * can open — a command, an env var, an identifier.
+ *
+ * Its click copies, so it wears plain CODE styling: `CHIP_BASE` with no accent
+ * colour and no underline, unlike the `CHIP_ACTIONABLE` look of the chips whose
+ * click navigates. Dressed as a link, this chip gets clicked for navigation and
+ * answers with a silent clipboard write. The copy cursor and the tooltip are
+ * what name the action instead.
+ *
+ * Every cue is NON-LAYOUT, because the chip must stay a plain inline `<code>`
+ * so a long span still breaks across lines: an `inline-flex` chip is atomic and
+ * overflows its container, and an in-flow icon appended on copy pushes the
+ * rest of the line over for 1.5s and back. So:
+ *
+ *  - the tooltip is the shared portal-rendered `InstantTip` (pointer after a
+ *    short intent delay, keyboard focus at once), which paints in its own layer;
+ *  - the confirmation is that same bubble flipping to "Copied!" for 1.5s;
+ *  - assistive tech hears the same word from an `sr-only` status region that
+ *    sits OUTSIDE the `<code>`. A `role="button"` element's children are
+ *    presentational, so a live region inside it would never be announced.
+ *
+ * The confirmation is gated on `copyToClipboard`'s boolean and a refused write
+ * is rendered, not swallowed — see `useCopiedFlash` and `CopyFailedNotice`.
+ *
+ * The accessible name says what the click does and to what ("Copy npm test").
+ * The text alone named a button whose purpose a screen-reader user could only
+ * guess at; the tooltip still reaches them as the description.
+ */
 function CopyableCode({ className, safeProps, text, children }: {
   className: string
   safeProps: Record<string, unknown>
   text: string
   children: React.ReactNode
 }) {
-  const { copied, flash } = useCopiedFlash()
+  const { copied, failed, copy, dismissFailure } = useCopiedFlash()
+  const { tip, tipHandlers, tipId } = useInstantTip()
+  const value = text.trim()
   const handleCopy = (e: React.MouseEvent | React.KeyboardEvent) => {
     e.preventDefault()
     e.stopPropagation()
-    copyToClipboard(text.trim())
-    flash()
+    copy(value)
   }
+  const cue = copied
+    ? i18nT('components.markdownRenderer.copied')
+    : i18nT('components.markdownRenderer.click_to_copy')
   return (
-    <code
-      className={`${className} cursor-pointer hover:underline`}
-      // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-copy)
-      role="button"
-      tabIndex={0}
-      onClick={handleCopy}
-      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') handleCopy(e) }}
-      title={copied
-        ? i18nT('components.markdownRenderer.copied')
-        : i18nT('components.markdownRenderer.click_to_copy')}
-      {...safeProps}
-    >
-      {children}
-      {copied && <Check size={12} aria-hidden="true" className="inline align-middle ml-0.5 opacity-70 pointer-events-none text-ok" />}
-    </code>
+    <>
+      <code
+        className={`${className} cursor-copy`}
+        // Inbound props first, so a `<code>` arriving from raw HTML cannot
+        // overwrite the role, the name or the handlers that make this honest.
+        {...safeProps}
+        // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-copy)
+        role="button"
+        tabIndex={0}
+        aria-label={i18nT('components.markdownRenderer.copy_chip_name', { text: value })}
+        onClick={handleCopy}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') handleCopy(e) }}
+        {...tipHandlers}
+      >
+        {children}
+      </code>
+      <InstantTip tip={tip} tipId={tipId} className="w-max max-w-[calc(100vw-1rem)]">{cue}</InstantTip>
+      {/* Always mounted, so the region exists before its text changes — a live
+          region that appears already filled is not reliably read. Empty, it
+          costs one out-of-flow node. */}
+      <span role="status" aria-live="polite" className="sr-only">
+        {copied ? i18nT('components.markdownRenderer.copied') : ''}
+      </span>
+      {failed && <CopyFailedNotice onDismiss={dismissFailure} />}
+    </>
   )
 }
 
@@ -1655,25 +1748,28 @@ function CopyableCode({ className, safeProps, text, children }: {
  * `stopPropagation` keeps the container's artifact-link delegation from also
  * firing for a click this chip has handled.
  */
-function SessionChip({ sessionKey, sessionTitle, safeProps, onOpen, children }: {
+function SessionChip({ sessionKey, sessionTitle, label, safeProps, onOpen, children }: {
   sessionKey: string
   sessionTitle: string
+  /** The span's visible text — the author's spelling of the key or short name. */
+  label: string
   safeProps: Record<string, unknown>
   onOpen: (key: string) => void
   children: React.ReactNode
 }) {
-  const { copied, flash } = useCopiedFlash()
+  const { copied, failed, copy, dismissFailure } = useCopiedFlash()
   const act = (e: { ctrlKey: boolean; metaKey: boolean; preventDefault: () => void; stopPropagation: () => void }) => {
     e.preventDefault()
     e.stopPropagation()
     // The NORMALISED key, not the author's spelling: `?sid=` rejects a
     // `dashboard_`-prefixed transcript filename.
-    if (e.ctrlKey || e.metaKey) { copyToClipboard(sessionKey); flash(); return }
+    if (e.ctrlKey || e.metaKey) { copy(sessionKey); return }
     onOpen(sessionKey)
   }
   return (
+    <>
     <code
-      className={`${CHIP_BASE} cursor-pointer hover:underline`}
+      className={CHIP_ACTIONABLE}
       // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-switch)
       role="button"
       tabIndex={0}
@@ -1681,6 +1777,12 @@ function SessionChip({ sessionKey, sessionTitle, safeProps, onOpen, children }: 
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') act(e) }}
       {...safeProps}
       data-session-key={sessionKey}
+      // The name states the action, same rule as the copy and path chips, and
+      // keeps the VISIBLE text: an `aria-label` replaces the content as the
+      // name, so naming only the title would drop the key the message is
+      // about and make two sessions with one title indistinguishable. The
+      // title rides in the three-line description below.
+      aria-label={i18nT('components.markdownRenderer.switch_to_session_chip_name', { label })}
       // Title leads: the key alone does not say which conversation this is.
       title={copied
         ? i18nT('components.markdownRenderer.copied')
@@ -1690,6 +1792,8 @@ function SessionChip({ sessionKey, sessionTitle, safeProps, onOpen, children }: 
       {children}
       {copied && <Check size={12} aria-hidden="true" className="inline align-middle ml-0.5 opacity-70 pointer-events-none text-ok" />}
     </code>
+    {failed && <CopyFailedNotice onDismiss={dismissFailure} />}
+    </>
   )
 }
 
@@ -1722,6 +1826,9 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
   // Failure state for the chip's reveal (Shift+click / no handler wired); rendered
   // beside the chip. Declared before the early returns below (rules of hooks).
   const reveal = useRevealFailure(raw)
+  // Feedback for the confirmed path chip's Ctrl/Cmd+click copy — the same gated
+  // write every other copy affordance in this file uses. Same placement rule.
+  const pathCopy = useCopiedFlash()
 
   // `data-path*` / `data-session-key` describe a chip THIS component rendered, so
   // only it may set them. rehypeSanitize allowlists every `data-*` attribute
@@ -1747,14 +1854,16 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     const reserve = pathResolution.shaped ? <ChipGlyphReserve path={pathResolution.splitPath} /> : null
     // Inside an anchor the link owns the click, so stay the inert span this was
     // before #4433 rather than cancelling the navigation to copy. Nothing is
-    // lost: the browser's own "Copy link address" still reaches the URL.
-    if (insideLink) return <code className={CHIP_BASE} {...safeProps}>{reserve}{children}</code>
+    // lost: the browser's own "Copy link address" still reaches the URL. It IS
+    // a link label, so it keeps the link colour.
+    if (insideLink) return <code className={`${CHIP_BASE} text-accent`} {...safeProps}>{reserve}{children}</code>
     const session = resolveSessionChip(raw, sessionActions)
     if (session) {
       return (
         <SessionChip
           sessionKey={session.key}
           sessionTitle={session.title}
+          label={raw}
           safeProps={safeProps}
           onOpen={sessionActions.onSessionOpen!}
         >{children}</SessionChip>
@@ -1781,7 +1890,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
           {/* The glyph is what tells this chip apart from a copy chip at
               rest: without it the two are pixel-identical and the click
               outcome (open a tab vs copy) is a surprise. */}
-          <code className={`${CHIP_BASE} cursor-pointer hover:underline`} {...safeProps}>{reserve}{children}<ExternalLink className="lucide-inline ml-1" aria-hidden /></code>
+          <code className={CHIP_ACTIONABLE} {...safeProps}>{reserve}{children}<ExternalLink className="lucide-inline ml-1" aria-hidden /></code>
         </a>
       )
     }
@@ -1809,7 +1918,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     e.preventDefault()
     e.stopPropagation()
     // Ctrl/Cmd+Click copies the path text rather than opening/revealing.
-    if (e.ctrlKey || e.metaKey) { copyToClipboard(raw); return }
+    if (e.ctrlKey || e.metaKey) { pathCopy.copy(raw); return }
     activatePath(path, kind, e.shiftKey, actions, reveal.onError, targetLine, targetEndLine)
   }
   // Right-click opens the shared file-path menu (Open in default app / reveal /
@@ -1822,7 +1931,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     <>
     <FilePathMenu filePath={path} kind={kind}>
       <code
-        className={`${CHIP_BASE} cursor-pointer hover:underline`}
+        className={CHIP_ACTIONABLE}
         // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-open path chip), same pattern as CopyableCode
         role="button"
         tabIndex={0}
@@ -1833,6 +1942,13 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
         data-path-kind={kind}
         data-path-line={targetLine}
         data-path-end-line={targetEndLine}
+        // The name states what the click does and to what — "Open src/a.py:12"
+        // for a file, "Browse src/" for a directory — so a screen-reader user
+        // can tell this chip from the copy chip before pressing it. `raw`, for
+        // the same reason the title uses it: the line suffix is the target.
+        aria-label={isDir
+          ? i18nT('components.markdownRenderer.browse_path_chip_name', { path: raw })
+          : i18nT('components.markdownRenderer.open_path_chip_name', { path: raw })}
         // The resolved path leads the tooltip, not just the instruction. A native
         // tooltip paints in the browser's own layer, above page content, and any
         // element overlaying the chip must be pointer-events-none to let the click
@@ -1843,7 +1959,12 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
         // `raw`, not `path`, so a `file:447` chip discloses the line it will jump
         // to. That keeps the disclosure honest without a second catalog string:
         // the location is already in the text the user is hovering.
-        title={`${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
+        //
+        // While a Ctrl/Cmd+click copy is confirmed the title says so, the same
+        // acknowledgment the session chip gives the same gesture.
+        title={pathCopy.copied
+          ? i18nT('components.markdownRenderer.copied')
+          : `${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
       >
         <Glyph size={CHIP_GLYPH_SIZE} aria-hidden="true" className={`${CHIP_GLYPH_GEOMETRY} opacity-70`} />
         {targetLine != null && raw.length > splitPath.length
@@ -1860,6 +1981,7 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     {reveal.error && (
       <ErrorNotice variant="inline" className="ml-1.5 align-baseline" message={reveal.error} askAgent onDismiss={reveal.clear} testId="md-chip-reveal-error" />
     )}
+    {pathCopy.failed && <CopyFailedNotice onDismiss={pathCopy.dismissFailure} />}
     </>
   )
 }
@@ -2182,7 +2304,7 @@ const MD_COMPONENTS: Components = {
  * is already honest there.
  */
 function BrokenImage({ path, alt, probeUrl }: { path: string; alt?: string; probeUrl?: string }) {
-  const { copied, flash } = useCopiedFlash()
+  const { copied, failed, copy, dismissFailure } = useCopiedFlash()
   const [confirmedGone, setConfirmedGone] = useState(false)
   useEffect(() => {
     // The verdict belongs to THIS probeUrl. A reused instance handed a different
@@ -2199,8 +2321,7 @@ function BrokenImage({ path, alt, probeUrl }: { path: string; alt?: string; prob
   const handleCopy = (e: React.MouseEvent | React.KeyboardEvent) => {
     e.preventDefault()
     e.stopPropagation()
-    copyToClipboard(path)
-    flash()
+    copy(path)
   }
   // The path leads the tooltip (same rule as the file-path chip) so a
   // truncated chip still discloses the real target — except when alt is
@@ -2210,6 +2331,7 @@ function BrokenImage({ path, alt, probeUrl }: { path: string; alt?: string; prob
     ? `${path}\n${i18nT('components.markdownRenderer.click_to_copy')}`
     : i18nT('components.markdownRenderer.click_to_copy')
   return (
+    <>
     <span
       className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-bg-elevated px-2 py-1 text-sm text-muted cursor-pointer hover:text-text"
       role="button"
@@ -2229,6 +2351,8 @@ function BrokenImage({ path, alt, probeUrl }: { path: string; alt?: string; prob
         ? <Check size={12} aria-hidden="true" className="shrink-0 text-ok" />
         : <Copy size={12} aria-hidden="true" className="shrink-0 opacity-70" />}
     </span>
+    {failed && <CopyFailedNotice onDismiss={dismissFailure} />}
+    </>
   )
 }
 /** Style reserving a not-yet-loaded transcript image's EXACT display box.

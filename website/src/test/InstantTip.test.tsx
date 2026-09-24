@@ -207,4 +207,21 @@ describe('InstantTip', () => {
     fireEvent.focus(anchor)
     expect(parseFloat(screen.getByRole('tooltip').style.top)).toBe(292)
   })
+
+  it('anchors to the FIRST line fragment of an inline anchor that wraps', () => {
+    // An inline chip broken across two lines: fragment one ends line 1 at the
+    // right (left 700), fragment two starts line 2 at the left margin (left 20).
+    // The bounding box's top-left (20, 300) is where NO fragment is; the bubble
+    // belongs above where the chip starts, (700, 300).
+    render(<Harness />)
+    const anchor = screen.getByRole('button', { name: 'anchor' })
+    const rect = (top: number, left: number, right: number): DOMRect =>
+      ({ top, left, right, bottom: top + 20, width: right - left, height: 20, x: left, y: top, toJSON: () => ({}) }) as DOMRect
+    anchor.getBoundingClientRect = () => rect(300, 20, 900)
+    anchor.getClientRects = () => [rect(300, 700, 900), rect(324, 20, 300)] as unknown as DOMRectList
+    fireEvent.focus(anchor)
+    const tip = screen.getByRole('tooltip')
+    expect(parseFloat(tip.style.top)).toBe(292)
+    expect(parseFloat(tip.style.left)).toBe(700)
+  })
 })

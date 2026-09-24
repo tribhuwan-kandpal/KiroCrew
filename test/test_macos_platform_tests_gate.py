@@ -29,8 +29,12 @@ and each one is quiet when it breaks:
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -292,3 +296,186 @@ class TestTheOnDemandLaneCannotBecomeAGate:
             "test/test_theme_install.py",
         ):
             assert path in darwin, f"{path} must select the native macOS suite"
+
+
+def _verdict_script() -> str:
+    """The `decide` job's verdict step, as bash, so its logic is executed not read."""
+    steps = _load("macos-on-demand.yml")["jobs"]["decide"]["steps"]
+    return next(step["run"] for step in steps if step.get("id") == "verdict")
+
+
+class TestTheMacOsPoolCeiling:
+    """The ceiling refuses `paths` and `sample` while this lane owns the macOS pool.
+
+    Measured on this repository: the lane holds 53 of 56 in-progress macOS jobs and
+    37 of 40 queued ones across 22 live runs, and one shard waited 14 hours for a
+    runner while `build.yml` and `release.yml` -- the signing paths, which cannot
+    run anywhere else -- queued behind it.
+
+    The step's bash is EXECUTED here against a stub `gh`, because every property
+    below lives in that script's control flow rather than in the workflow's shape:
+    a yaml assertion would pass on a ceiling wired to the wrong switch.
+    """
+
+    def _run(
+        self,
+        tmp_path: Path,
+        *,
+        paths_hit: str = "false",
+        labelled: str = "false",
+        head_sha: str = "1" * 40,
+        in_progress: str = "0",
+        queued: str = "0",
+        ceiling: str = "6",
+        attempt: str = "1",
+        gh_rc: str = "0",
+    ) -> tuple[dict[str, str], str, list[str]]:
+        bash = shutil.which("bash")
+        if bash is None:  # pragma: no cover - POSIX CI always has bash
+            pytest.skip("bash is required to execute the verdict step")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        calls = tmp_path / "gh-calls"
+        calls.touch()
+        stub = bin_dir / "gh"
+        stub.write_text(
+            "#!/bin/sh\n"
+            'printf "%s\\n" "$*" >> "$GH_CALLS"\n'
+            'if [ "$STUB_RC" != "0" ]; then exit "$STUB_RC"; fi\n'
+            'case "$*" in\n'
+            '  *status=in_progress*) echo "$STUB_IN_PROGRESS" ;;\n'
+            '  *status=queued*) echo "$STUB_QUEUED" ;;\n'
+            "  *) echo 0 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        out_file = tmp_path / "gh-output"
+        out_file.touch()
+        proc = subprocess.run(
+            [bash, "-c", _verdict_script()],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env={
+                **os.environ,
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                "GH_TOKEN": "stub",
+                "GH_CALLS": str(calls),
+                "STUB_IN_PROGRESS": in_progress,
+                "STUB_QUEUED": queued,
+                "STUB_RC": gh_rc,
+                "PATHS_HIT": paths_hit,
+                "LABELLED": labelled,
+                "HEAD_SHA": head_sha,
+                "SAMPLE_ONE_IN": "20",
+                "LANE_MAX_LIVE_RUNS": ceiling,
+                "RUN_ATTEMPT": attempt,
+                "GITHUB_REPOSITORY": "kirodotdev/KiroCrew",
+                "GITHUB_RUN_ID": "999",
+                "GITHUB_OUTPUT": str(out_file),
+            },
+            cwd=tmp_path,
+        )
+        assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        outputs = dict(
+            line.split("=", 1)
+            for line in out_file.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+        )
+        gh_calls = [line for line in calls.read_text(encoding="utf-8").splitlines() if line]
+        return outputs, proc.stdout, gh_calls
+
+    def test_a_path_hit_is_refused_while_the_lane_already_owns_the_pool(
+        self, tmp_path: Path
+    ) -> None:
+        outputs, stdout, gh_calls = self._run(
+            tmp_path, paths_hit="true", in_progress="5", queued="2", ceiling="6"
+        )
+        assert outputs["run"] == "false"
+        assert outputs["reason"] == "pool-cap"
+        # The notice has to name the count, the ceiling and the way out, or the
+        # author of a skipped pull request cannot tell this from "no darwin path".
+        assert "7 live lane run(s)" in stdout and "ceiling 6" in stdout
+        assert "ci:macos" in stdout
+        assert len(gh_calls) == 2
+
+    def test_a_path_hit_runs_while_the_pool_has_room(self, tmp_path: Path) -> None:
+        outputs, stdout, _ = self._run(
+            tmp_path, paths_hit="true", in_progress="3", queued="2", ceiling="6"
+        )
+        assert outputs["run"] == "true"
+        assert outputs["reason"] == "paths"
+        assert "pool" not in stdout.lower()
+
+    def test_the_label_is_never_refused_and_spends_no_quota(self, tmp_path: Path) -> None:
+        """The label is the on-demand path a fixer uses on a red nightly.
+
+        Silencing it when the pool is busy would remove the one request where
+        waiting out the queue is the whole point, so the ceiling is not even
+        measured -- which is also why a labelled run costs no API call.
+        """
+        outputs, _, gh_calls = self._run(
+            tmp_path, paths_hit="true", labelled="true", in_progress="99", ceiling="1"
+        )
+        assert outputs["run"] == "true"
+        assert "label" in outputs["reason"]
+        assert gh_calls == []
+
+    def test_a_rerun_ignores_the_ceiling_so_a_red_run_cannot_vanish(self, tmp_path: Path) -> None:
+        """Same property the SHA sample protects: a retry must not erase a verdict.
+
+        A ceiling applied on every attempt would let a re-run of a RED lane turn
+        into a skip whenever the pool happened to be busy the second time.
+        """
+        outputs, _, gh_calls = self._run(
+            tmp_path, paths_hit="true", in_progress="99", ceiling="1", attempt="2"
+        )
+        assert outputs["run"] == "true"
+        assert outputs["reason"] == "paths"
+        assert gh_calls == []
+
+    def test_an_unreadable_count_fails_open(self, tmp_path: Path) -> None:
+        """The ceiling is an allocation choice, not a safety control.
+
+        A lane that stops covering darwin because one API call failed is the worse
+        error, so the suite runs and the tick says why it was not bounded.
+        """
+        outputs, stdout, _ = self._run(
+            tmp_path, paths_hit="true", in_progress="99", ceiling="1", gh_rc="1"
+        )
+        assert outputs["run"] == "true"
+        assert outputs["reason"] == "paths"
+        assert "::warning::" in stdout and "could not be read" in stdout
+
+    def test_a_non_numeric_count_fails_open_too(self, tmp_path: Path) -> None:
+        # A zero exit with junk on stdout is the shape an API change takes, and
+        # arithmetic on it would either abort the step or invent a number.
+        outputs, stdout, _ = self._run(
+            tmp_path, paths_hit="true", in_progress="not-a-number", ceiling="1"
+        )
+        assert outputs["run"] == "true"
+        assert "could not be read" in stdout
+
+    def test_no_switch_at_all_still_reads_as_no_switch(self, tmp_path: Path) -> None:
+        # `pool-cap` must not swallow the ordinary skip: an author reading
+        # `reason=none` learns something different from `reason=pool-cap`.
+        outputs, _, gh_calls = self._run(tmp_path, paths_hit="false", in_progress="99", ceiling="1")
+        assert outputs["run"] == "false"
+        assert outputs["reason"] == "none"
+        assert gh_calls == []
+
+    def test_the_sample_switch_is_subject_to_the_ceiling(self, tmp_path: Path) -> None:
+        # A head SHA whose first 8 hex digits are divisible by 20: bucket 0.
+        outputs, _, gh_calls = self._run(
+            tmp_path, head_sha="00000000" + "a" * 32, in_progress="9", ceiling="6"
+        )
+        assert outputs["reason"] == "pool-cap"
+        assert len(gh_calls) == 2
+
+    def test_the_decide_job_may_only_read_actions(self) -> None:
+        decide = _load("macos-on-demand.yml")["jobs"]["decide"]
+        assert decide["permissions"] == {"contents": "read", "actions": "read"}
+        # Counting is workflow-scoped, so it needs neither paging nor a wider read.
+        assert "actions/workflows/macos-on-demand.yml/runs" in _verdict_script()

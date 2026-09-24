@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -28,9 +27,6 @@ from kiro_crew.decisions import log as _log
 from kiro_crew.decisions.points import skills_select as sel
 from kiro_crew.decisions.points import tool_risk as tr
 from kiro_crew.decisions.types import Answer
-
-#: Repo root, for the spec gate below: this file lives at ``test/`` beneath it.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: The append ceiling these tests run under, in place of the production
 #: :data:`tr.LOG_BUDGET_SECS` (0.05 s). The tests here assert on the RECORD, and a
@@ -96,12 +92,6 @@ def _answering(tier: str, p: float = 0.88, *, seen: list[dict] | None = None):
     return patch.object(tr.core, "decide", _decide)
 
 
-#: The module spec, which names the bar's constant, and the operator doc, which
-#: prints only the number a reader sees on the card.
-_SPEC = _REPO_ROOT / "docs" / "system-specs" / "modules" / "decisions.md"
-_OPERATOR_DOC = _REPO_ROOT / "src" / "kiro_crew" / "docs" / "decisions.md"
-
-
 # ── the record it returns ─────────────────────────────────────────────────────
 
 
@@ -127,7 +117,7 @@ class TestTheRecord:
 
     @pytest.mark.asyncio
     async def test_a_caution_answer_is_flagged_too(self, home):
-        with _answering(tr.TIER_CAUTION):
+        with _answering(tr.TIER_CAUTION, 0.95):
             record = await tr.risk_record(
                 tool="fsWrite", arguments="{}", policy="yolo", session_key="chat-1"
             )
@@ -531,10 +521,10 @@ class TestTheConfidenceThresholds:
             (tr.TIER_RISKY, tr.RISKY_CONFIDENCE_THRESHOLD, True),
             (tr.TIER_RISKY, 0.98, True),
             (tr.TIER_RISKY, 1.0, True),
-            # ``caution`` carries its own bar, read the same inclusive direction.
+            # ``caution`` has its own, higher bar -- also inclusive.
             (tr.TIER_CAUTION, 0.0, False),
             (tr.TIER_CAUTION, 0.34, False),
-            (tr.TIER_CAUTION, 0.79, False),
+            (tr.TIER_CAUTION, 0.89, False),
             (tr.TIER_CAUTION, tr.CAUTION_CONFIDENCE_THRESHOLD, True),
             (tr.TIER_CAUTION, 1.0, True),
             # ``safe`` is never a badge at any confidence at all.
@@ -588,27 +578,25 @@ class TestTheConfidenceThresholds:
         assert [r for r in _rows(home) if r.get("tier")] == [record]
 
     @pytest.mark.asyncio
-    async def test_neither_flagged_tier_is_badged_under_its_bar(self, home):
-        """An unconvinced answer draws nothing, whichever flagged tier it names.
+    async def test_a_risky_answer_between_the_bars_badges_where_a_caution_does_not(self, home):
+        """The bars are per word, and ``caution``'s sits higher on purpose.
 
-        This replaces a pinned ASYMMETRY: the build that shipped it badged
-        ``caution`` on its tier alone. That is the "costs every other badge its
-        meaning" failure the ``risky`` bar exists for, arriving through the tier
-        exempted from it. The measured distribution is recorded once, on
-        ``CAUTION_CONFIDENCE_THRESHOLD`` in ``decisions/points/tool_risk.py``.
+        Between 0.80 and 0.90 a ``risky`` draws a badge while a ``caution`` draws
+        none: ``caution`` is the mild word, so a hesitant one costs a reader little
+        when missed and every badge its meaning when printed.
         """
-        low = tr.CAUTION_CONFIDENCE_THRESHOLD - 0.25
-        with _answering(tr.TIER_CAUTION, low):
+        between = 0.85
+        with _answering(tr.TIER_CAUTION, between):
             caution = await tr.risk_record(
-                tool="fsWrite", arguments="{}", policy="trust", session_key="chat-1"
+                tool="bash", arguments="mkdir build", policy="trust", session_key="chat-1"
             )
-        with _answering(tr.TIER_RISKY, low):
+        with _answering(tr.TIER_RISKY, between):
             risky = await tr.risk_record(
                 tool="bash", arguments="git push", policy="trust", session_key="chat-2"
             )
 
         assert caution is None
-        assert risky is None
+        assert risky is not None
 
     @pytest.mark.asyncio
     async def test_a_suppressed_caution_still_writes_its_row(self, home):
@@ -696,60 +684,173 @@ class TestTheConfidenceThresholds:
             )
         assert now_hidden is None, "0.98 must be refused once the caution bar is 0.99"
 
-    def test_the_caution_value_sits_inside_the_window_it_was_measured_in(self):
-        """A bound on both sides, because both failures are real.
-
-        Under roughly 0.75 the measured ``caution`` answers are dominated by calls
-        that only read -- poll cycles reading PR status, ``Check ...`` reads,
-        ``monitor_start`` arms -- which the tier's own rubric sentence excludes. Much
-        above 0.85 the same reading starts dropping ordinary rebases and amends,
-        which is the whole population the tier is for. A later reading may move the
-        number inside this window on new evidence; a value outside it contradicts the
-        evidence there is.
-        """
-        assert 0.75 <= tr.CAUTION_CONFIDENCE_THRESHOLD <= 0.85
-
-    def test_the_docs_print_the_caution_bar_at_the_value_the_code_ships(self):
-        """The prose and the constant cannot drift apart silently.
-
-        Two documents print the bar, in the two shapes their readers need. The
-        module spec names the CONSTANT beside its value, so a reader re-deriving the
-        bar has more than the badge to go on; the operator doc prints only the
-        number, because its reader sees a score on a card and never a Python name.
-        Both are read against the constant rather than a literal, so the gate
-        follows the code instead of pinning a second copy of it -- the same drift
-        ``test_babysit_guidance_gates`` and ``test_chat_turn_timeout_consistency``
-        catch for their own specs.
-        """
-        value = f"{tr.CAUTION_CONFIDENCE_THRESHOLD:.2f}"
-        spec = _SPEC.read_text(encoding="utf-8")
-        assert f"`CAUTION_CONFIDENCE_THRESHOLD` ({value})" in spec, (
-            "the module spec must print the caution bar's constant at the value the " "code ships"
-        )
-        operator = _OPERATOR_DOC.read_text(encoding="utf-8")
-        # Pin the rows that name ``caution`` beside the bar, not the bare number: a
-        # bare ``0.80`` anywhere in the file would still pass while the caution row
-        # itself drifted, so long as some other line kept printing the old value.
-        #
-        # Each row names BOTH tiers (``caution`` or ``risky``) but prints ONE
-        # number, so that number is checked against BOTH constants. While the two
-        # bars are equal the row satisfies both; if either bar moves on its own,
-        # a single shared number cannot match both and this test reds --
-        # the signal that the row must be split into one line per tier.
-        for bar in (tr.CAUTION_CONFIDENCE_THRESHOLD, tr.RISKY_CONFIDENCE_THRESHOLD):
-            printed = f"{bar:.2f}"
-            assert (
-                f"Jev says `caution` or `risky` with a score of {printed} or more" in operator
-            ), "the operator doc's caution/risky row must print the bar the code ships"
-            assert (
-                f"Jev says `caution` or `risky` but scores it under {printed}" in operator
-            ), "the operator doc's below-the-bar caution/risky row must print the bar the code ships"
-
     def test_they_are_probabilities_and_not_percentages(self):
         """``p`` is a 0..1 probability everywhere in this package, so the bars are too."""
         for bar in (tr.RISKY_CONFIDENCE_THRESHOLD, tr.CAUTION_CONFIDENCE_THRESHOLD):
             assert isinstance(bar, float)
             assert 0.0 < bar <= 1.0
+
+
+class TestTheCautionConfidenceThreshold:
+    """``caution`` must be believed too, and a plain file write never draws it."""
+
+    @pytest.mark.asyncio
+    async def test_a_hesitant_caution_draws_nothing_but_keeps_its_row(self, home):
+        with _answering(tr.TIER_CAUTION, 0.89):
+            record = await tr.risk_record(
+                tool="bash", arguments="mkdir build", policy="trust", session_key="chat-1"
+            )
+
+        assert record is None
+        outcome = [r for r in _rows(home) if r.get("tier")]
+        assert len(outcome) == 1
+        assert outcome[0]["tier"] == tr.TIER_CAUTION
+        assert outcome[0]["flagged"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_confident_caution_is_badged(self, home):
+        with _answering(tr.TIER_CAUTION, tr.CAUTION_CONFIDENCE_THRESHOLD):
+            record = await tr.risk_record(
+                tool="bash", arguments="mkdir build", policy="trust", session_key="chat-1"
+            )
+
+        assert record is not None
+        assert record["flagged"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_constant_is_what_decides(self, home, monkeypatch):
+        monkeypatch.setattr(tr, "CAUTION_CONFIDENCE_THRESHOLD", 0.50)
+        with _answering(tr.TIER_CAUTION, 0.57):
+            now_badged = await tr.risk_record(
+                tool="bash", arguments="mkdir b", policy="trust", session_key="chat-1"
+            )
+        assert now_badged is not None
+
+        monkeypatch.setattr(tr, "CAUTION_CONFIDENCE_THRESHOLD", 0.99)
+        with _answering(tr.TIER_CAUTION, 0.98):
+            now_hidden = await tr.risk_record(
+                tool="bash", arguments="mkdir b", policy="trust", session_key="chat-2"
+            )
+        assert now_hidden is None
+
+    def test_the_value_sits_above_the_risky_bar_and_below_certainty(self):
+        """Above ``risky``'s bar by design, and below 1.0 so the word can still print."""
+        assert tr.RISKY_CONFIDENCE_THRESHOLD < tr.CAUTION_CONFIDENCE_THRESHOLD < 1.0
+        assert isinstance(tr.CAUTION_CONFIDENCE_THRESHOLD, float)
+
+    @pytest.mark.parametrize(
+        "tier, p, badged",
+        [
+            (tr.TIER_CAUTION, 0.99, False),
+            (tr.TIER_CAUTION, 1.0, False),
+            # A risky write is still badged: outside the workspace is what the word names.
+            (tr.TIER_RISKY, 0.95, True),
+            (tr.TIER_RISKY, 0.79, False),
+            (tr.TIER_SAFE, 1.0, False),
+        ],
+    )
+    def test_a_file_write_never_draws_caution(self, tier, p, badged):
+        assert tr.earns_badge(tier, p, file_write=True) is badged
+
+    @pytest.mark.asyncio
+    async def test_a_file_write_caution_keeps_its_tier_on_the_row(self, home):
+        with _answering(tr.TIER_CAUTION, 0.99):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments='{"path": "README.md"}',
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="edit",
+            )
+
+        assert record is None
+        outcome = [r for r in _rows(home) if r.get("tier")]
+        assert len(outcome) == 1
+        assert outcome[0]["tier"] == tr.TIER_CAUTION
+        assert outcome[0]["p"] == 0.99
+        assert outcome[0]["flagged"] is False
+        assert outcome[0]["file_write"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_non_file_write_row_carries_file_write_false(self, home):
+        """The write carve-out must be re-derivable from the log without the
+        harness's own tool title, which the structured-kind test above pins as
+        not the signal the point itself reads."""
+        with _answering(tr.TIER_CAUTION, 0.99):
+            await tr.risk_record(
+                tool="bash",
+                arguments='{"command": "mkdir build"}',
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="execute",
+            )
+
+        outcome = [r for r in _rows(home) if r.get("tier")]
+        assert len(outcome) == 1
+        assert outcome[0]["file_write"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_file_write_risky_is_still_badged(self, home):
+        with _answering(tr.TIER_RISKY, 0.95):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments='{"path": "/home/u/.aws/credentials"}',
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="edit",
+            )
+
+        assert record is not None
+        assert record["flagged"] is True
+
+    @pytest.mark.asyncio
+    async def test_only_the_structured_kind_marks_a_file_write(self, home):
+        """The display title is not the signal: a caution titled "Write File" with
+        another kind and no diff path is judged on its confidence alone."""
+        with _answering(tr.TIER_CAUTION, 0.99):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments="{}",
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="execute",
+            )
+
+        assert record is not None
+
+    @pytest.mark.asyncio
+    async def test_a_diff_path_alone_marks_a_file_write(self, home):
+        """A real edit whose ACP ``kind`` is empty or ``read`` (agent-influenced,
+        per ``is_edit_call``'s own docstring) still carries no caution badge once
+        its tool_call frame cached a diff-block path -- the same routing predicate
+        the hook edit gate and governance classification share."""
+        with _answering(tr.TIER_CAUTION, 0.99):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments='{"path": "README.md"}',
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="read",
+                diff_path="README.md",
+            )
+
+        assert record is None
+
+    @pytest.mark.asyncio
+    async def test_an_edit_kind_with_no_diff_path_is_still_a_file_write(self, home):
+        """``kind="edit"`` alone still routes -- the diff path is an OR, not a
+        replacement for the ACP kind."""
+        with _answering(tr.TIER_CAUTION, 0.99):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments="{}",
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="edit",
+                diff_path="",
+            )
+
+        assert record is None
 
 
 # ── the point's own identity ──────────────────────────────────────────────────

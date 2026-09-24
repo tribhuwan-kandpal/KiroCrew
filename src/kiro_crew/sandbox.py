@@ -1111,8 +1111,42 @@ def carveout_chain_has_planted_link(path: str) -> bool:
     return False
 
 
+def _window_is_a_hidden_target(path: str, hidden_dirs: Iterable[str]) -> bool:
+    """Whether *path* as a private window IS one of the directories that stay hidden.
+
+    A mask lift written as a window. Refused on every backend and at every producer,
+    because nothing downstream can make it safe: the window is the masked tree.
+    """
+    probe = path.rstrip(os.sep)
+    return any(probe == hidden.rstrip(os.sep) for hidden in hidden_dirs)
+
+
+def _window_contains_a_hidden_target(path: str, hidden_dirs: Iterable[str]) -> bool:
+    """Whether *path* as a private window would hold a directory that stays hidden.
+
+    Unlike the EQUALS case this one is an ORDERING problem rather than a contradiction:
+    the window is re-bound read-write over the tree, so a nested mask applied BEFORE
+    that bind lands on the path the window then shadows, and the leaf comes back with
+    it. A backend that can re-apply the nested mask AFTER binding the window -- the
+    Linux launcher does, from a descriptor it already holds -- keeps the leaf hidden and
+    the rest of the window live. A backend that expresses masks as path rules with no
+    ordering it controls cannot, so there it stays refused.
+
+    This is why the question is asked of the whole mask set rather than of the one
+    parent a window matched: an entry can be a proper descendant of one hidden tree
+    while being an ancestor of another hidden leaf inside it -- ``apps/meetings/data``
+    under a masked ``apps`` tree holds the masked ``apps/meetings/data/edits`` -- and a
+    per-parent test accepts it on the strength of the first relationship.
+    """
+    probe = path.rstrip(os.sep)
+    return any(hidden.rstrip(os.sep).startswith(probe + os.sep) for hidden in hidden_dirs)
+
+
 def _private_window_spellings(
-    extra_private_dirs: tuple[str, ...], hidden_dirs: list[str]
+    extra_private_dirs: tuple[str, ...],
+    hidden_dirs: list[str],
+    *,
+    remasks_contained_targets: bool = False,
 ) -> list[str]:
     """The ``extra_private_dirs`` entries that name a PROPER descendant of a
     directory that stays hidden.
@@ -1122,12 +1156,38 @@ def _private_window_spellings(
     ``extra_visible_dirs`` it never lifts the parent's mask: siblings stay
     hidden, only the window is re-exposed (read-write, it is the process's
     own). An entry that is not inside a hidden tree needs no window and is
-    dropped; one that EQUALS a hidden target is refused, since that would be a
-    mask lift by another name. Lexical, like every other path rule here.
+    dropped. Lexical, like every other path rule here.
+
+    An entry that EQUALS a hidden target is always refused: the window IS the masked
+    tree, and nothing downstream can make that safe. An entry that CONTAINS one is
+    refused UNLESS the caller states it re-applies the nested mask after binding the
+    window (``remasks_contained_targets``) -- the Linux launcher does, so the leaf stays
+    hidden and the app keeps its data view; the Seatbelt profile cannot order its rules
+    that way, so there the refusal stands. This is the single gate every caller's windows
+    pass through, so both decisions belong here and not in each producer, and refusing is
+    the fail-closed direction: the window is withheld and the parent's mask keeps
+    covering the path.
     """
     windows: list[str] = []
     for raw in extra_private_dirs:
         path = os.path.abspath(raw)
+        refused = _window_is_a_hidden_target(path, hidden_dirs) or (
+            not remasks_contained_targets and _window_contains_a_hidden_target(path, hidden_dirs)
+        )
+        if refused:
+            # NEITHER path is logged. The mask set's own entries name credential and
+            # authorization stores, so writing them into a log records the layout of
+            # exactly what the set exists to hide. The refusal is deterministic and
+            # reproducible from the caller's own arguments, and the one producer that
+            # can hit it in ordinary operation names the app itself at debug level,
+            # so the path adds nothing a reader cannot already get.
+            logger.warning(
+                "SECURITY: not opening a private window that is or contains a masked "
+                "directory -- a window is re-bound read-write over the mask, so that "
+                "path stays masked for this spawn. Every other window and the spawn "
+                "itself are unaffected."
+            )
+            continue
         for parent in hidden_dirs:
             if path.startswith(parent.rstrip(os.sep) + os.sep):
                 windows.append(path)
@@ -2402,6 +2462,264 @@ def _materialize_maskable_dirs() -> list[str]:
             ) from exc
         created.append(target)
     return created
+
+
+def materialize_caller_masked_dir(target: str) -> bool:
+    """Create an absent caller-supplied mask path so the primitive has a name to bind.
+
+    Both launcher loops that consume a caller's paths are guarded on ``isdir``: an
+    absent ``extra_hidden_dirs`` target gets no empty bind, and an absent
+    ``extra_private_dirs`` window gets no re-exposing bind. Either way the primitive
+    does nothing and says nothing, so the path has to exist before the spawn.
+
+    :func:`_materialize_maskable_dirs` does this for the tier's OWN hidden leaves and
+    states the mask half of the reason: the launcher's ``SENSITIVE_DIRS`` loop is
+    guarded on ``isdir``, so an absent target gets no empty bind and whatever creates
+    the directory later is plainly visible to the running child. A CALLER-supplied path
+    carries the same requirement and had no such step, because the tier lists are fixed
+    at import while a caller's entry is computed per spawn -- so a caller whose mask
+    target is created on first use masked nothing on a home that had not reached that
+    use yet.
+
+    Same fail-closed shape as the tier version: a dangling link squatting the name, a
+    symlinked leaf (``isdir`` would follow it and the mask would cover the link's
+    target rather than the replaceable name), a plain file at the path, or a creation
+    failure other than ``EEXIST`` raises :class:`SandboxCeilingUnsealable`. Launching
+    anyway would run the child with the tree unmasked, which is the exposure the caller
+    asked for a mask to close.
+
+    ``mkdir`` without ``parents``, for the reason :func:`_materialize_maskable_dirs`
+    gives about its own leaves: an intermediate directory created here would be an
+    agent-writable ancestor a rename could swap out from under the mount. An absent
+    PARENT therefore refuses rather than building the chain.
+
+    Returns whether it created the directory. An existing one is left exactly as it is,
+    mode included: a caller's mask target is often a directory some other component
+    owns and populates, and tightening its mode here would change that component's
+    behaviour for a reason having nothing to do with this spawn.
+    """
+    _refuse_if_dangling_symlink(target)
+    _refuse_if_symlink_leaf(target)
+    if os.path.isdir(target):
+        return False
+    if os.path.exists(target):
+        raise SandboxCeilingUnsealable(
+            f"cannot mask {safe_terminal_line(target)}: a non-directory is sitting at the path"
+        )
+    try:
+        os.mkdir(target, 0o700)
+    except FileExistsError:
+        # Something won the create race. ``FileExistsError`` does not say what now sits
+        # at the name, so re-validate with NO-FOLLOW semantics: a symlink slipped in
+        # during the window must refuse, not be masked over.
+        _require_real_dir_nofollow(target)
+        return False
+    except OSError as exc:
+        raise SandboxCeilingUnsealable(
+            f"cannot create the masked directory {safe_terminal_line(target)}: "
+            f"{safe_terminal_line(str(exc))}"
+        ) from exc
+    return True
+
+
+def masked_dir_identity(target: str) -> tuple[str, int, int]:
+    """*target* with the directory identity the caller's mask is about.
+
+    A mask root travels to the launcher as a NAME, and the launcher binds an empty
+    directory over whatever answers to it. That is enough for a name nobody else can
+    write, and not enough for one under a directory an agent can rename: a real
+    directory renamed onto the name is masked in the original's place, and the tree the
+    caller asked to hide stays readable at the name it was moved to. Pairing the name
+    with the ``(dev, ino)`` read HERE, in the act that settles which directory the mask
+    is for, gives the child something a rename cannot satisfy.
+
+    Read with no-follow semantics and in the same act as the approval, because a second
+    lookup would record whatever a rename has just put there. Fail closed on anything
+    other than a real directory, matching :func:`materialize_caller_masked_dir`: a mask
+    root whose identity cannot be read is one the child cannot be asked to confirm.
+    """
+    try:
+        st = os.lstat(target)
+    except OSError as exc:
+        raise SandboxCeilingUnsealable(
+            f"cannot read the identity of the masked directory "
+            f"{safe_terminal_line(target)}: {safe_terminal_line(str(exc))}"
+        ) from exc
+    if not stat.S_ISDIR(st.st_mode):
+        raise SandboxCeilingUnsealable(
+            f"cannot mask {safe_terminal_line(target)}: the path stopped being a directory"
+        )
+    return (target, st.st_dev, st.st_ino)
+
+
+class AppDataWindow(NamedTuple):
+    """One app's data window, with the directory identity its approval was about.
+
+    ``path`` is what the sandbox primitive consumes. ``dev`` and ``ino`` are what the
+    child compares the descriptor it pins against, because the name alone cannot tell an
+    approved directory from a real one renamed onto it after the approval.
+    """
+
+    path: str
+    dev: int
+    ino: int
+
+
+def app_data_window_targets(apps_tree: str) -> tuple[AppDataWindow, ...]:
+    """Each installed app's ``data`` directory under *apps_tree*, as private windows.
+
+    A caller that masks the whole apps tree to withhold every ``.app_secret`` also
+    covers ``apps/<app>/data``, which :func:`kiro_crew.apps.manager.app_data_dir`
+    documents as an app's persistence root. On Linux the mask binds a WRITABLE empty
+    directory over the tree, so a child writing there is told the write succeeded and
+    the bytes are discarded when the namespace goes away -- success with no data and no
+    error to notice. ``extra_private_dirs`` is the primitive for that shape: it keeps
+    the parent's mask and every sibling denied and re-exposes just these directories on
+    their real inodes at their real paths, read-write.
+
+    ``extra_visible_dirs`` is the wrong primitive here even though it reads like the
+    right one. ``_hidden_path_contains_visible_path`` cancels a mask entry that CONTAINS
+    a visible path, so carving one app's data out would lift the mask off the whole tree
+    and hand the child every OTHER app's credential -- the exposure the mask exists to
+    close.
+
+    The returned paths are joined onto the caller's own *apps_tree* string, so each one
+    matches that mask entry under the purely lexical ``startswith`` test
+    :func:`_private_window_spellings` applies. A caller masking a different spelling of
+    the same tree gets no window from this function, which withholds a view rather than
+    lifting a mask.
+
+    Each directory is CREATED when absent, for the reason
+    :func:`materialize_caller_masked_dir` gives about the mask loop: the launcher's
+    ``PRIVATE_DIRS`` loop is guarded on ``isdir`` too, so a window whose directory does
+    not exist yet is skipped in silence and the parent's mask covers the path -- an app
+    whose first-ever write happens inside a cron child would lose exactly that write.
+
+    Creating a directory makes WHICH entries count as apps load-bearing, so the entry's
+    name has to have the shape the app contract issues --
+    :data:`kiro_crew.apps.manifest.KEBAB_RE`, which every admission path enforces. The
+    apps tree also holds the manager's own dot-prefixed lifecycle move-asides, and
+    creating inside one of those writes into a tree the next restore moves onto an app's
+    real persistence root. A name differing from an installed app's only by case matters
+    for a second reason: on a case-insensitive filesystem it resolves to that app's
+    directory, while the tier-collision test below compares path text, so the lowercase
+    rule is what keeps that comparison sufficient. The contract's RESERVED and unportable
+    names are admitted here, because nothing revalidates the name of an app already
+    installed: refusing one would withhold a live app's window and silently discard its
+    cron writes.
+
+    DEGRADES, never raises. A per-app problem -- a link squatting the app directory or
+    the ``data`` name, a plain file at either, a create that fails, or a data tree the
+    tier masks in its own right -- withholds that ONE
+    window and leaves its app's data masked, which is the fail-closed direction. The
+    alternative, refusing the spawn, lets one app's on-disk layout stop every cron on
+    the host, and the reasoning :func:`carveout_chain_has_planted_link` states applies
+    unchanged: an unverifiable path earns no view.
+
+    Returns ``()`` when the tree does not exist or cannot be listed, leaving the
+    caller's mask the only thing this spawn carries.
+    """
+    try:
+        entries = sorted(os.scandir(apps_tree), key=lambda e: e.name)
+    except OSError as exc:
+        logger.debug(
+            "could not list the apps tree %s for data windows: %s",
+            safe_terminal_line(apps_tree),
+            safe_terminal_line(str(exc)),
+        )
+        return ()
+    hidden_targets = _crew_hidden_sandbox_targets()
+    # Local import: sandbox is a low-level dependency, and ``kiro_crew.apps`` reaches
+    # back into it -- the dev-fleet bridge imports the spawn helpers at module level --
+    # so binding the contract at call time keeps the package graph acyclic.
+    from kiro_crew.apps.manifest import KEBAB_RE
+
+    windows: list[AppDataWindow] = []
+    for entry in entries:
+        # The one property this loop needs from a name is its SHAPE, and
+        # ``kiro_crew.apps.manifest.KEBAB_RE`` is where the app contract states it: every
+        # admission path -- install, update, discovery, self-registration -- forces
+        # lowercase kebab-case through it, so a directory spelled any other way was never
+        # issued to an app. Matching with ``fullmatch`` because the pattern ends in ``$``,
+        # which also matches before a trailing newline. That settles two cases this loop
+        # cannot otherwise tell apart.
+        #
+        # The apps tree holds the manager's OWN lifecycle move-asides beside the apps
+        # (``.<name>-data-tmp``, ``.<name>-secret-tmp``, ``.<name>-update-old-*``,
+        # ``.<name>-deps-doomed*``), and a crashed operation leaves one in place
+        # indefinitely. Because an absent window is CREATED, reading one as an app writes
+        # a ``data`` child inside it, and the restore leg moves that directory onto the
+        # app's live persistence root, into preserved data.
+        #
+        # A name that differs from an installed app's only by CASE is the other: on a
+        # case-insensitive filesystem ``AWS-Control`` IS the ``aws-control`` the tier
+        # hides, while the collision test below compares path text and does not match the
+        # other spelling, so admitting it re-binds the owner-authorization store
+        # read-write for the child. Refusing the spelling the contract never issued keeps
+        # the text comparison sufficient. A reserved or unportable name is a different
+        # matter and is ADMITTED: nothing revalidates an installed app's name when it is
+        # loaded, so an app installed before its name was reserved keeps running, and
+        # withholding its window is what would discard its cron writes.
+        if not KEBAB_RE.fullmatch(entry.name):
+            continue
+        # NO-FOLLOW: a link planted at an app's own directory name would otherwise be
+        # traversed here and its target re-exposed inside the masked tree.
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        window = os.path.join(apps_tree, entry.name, "data")
+        # An app whose data tree the tier masks in its own right gets no window: the
+        # two masks are independent, and the app-data window is re-bound over the tree
+        # mask, so emitting one would carry the tier's leaf back with it.
+        # :func:`_private_window_spellings` refuses this too and is what makes the
+        # guarantee hold for every caller -- skipping here keeps the ordinary case
+        # (aws-control or meetings installed) from logging a refusal per spawn for a
+        # path that is masked by design.
+        if _window_is_a_hidden_target(window, hidden_targets):
+            logger.debug(
+                "no data window for %s: the window IS a directory the tier masks in its "
+                "own right, which stays masked",
+                safe_terminal_line(entry.name),
+            )
+            continue
+        try:
+            materialize_caller_masked_dir(window)
+        except SandboxCeilingUnsealable as exc:
+            # An app DIRECTORY NAME is agent-created, and the refusal text carries a
+            # path, so both reach the operator's log through a plain formatter: a name
+            # holding newlines or an ANSI escape would forge log lines and rewrite the
+            # terminal on every cron run. Sanitized the way every sibling refusal on
+            # these same targets already is.
+            logger.warning(
+                "SECURITY: not opening a data window for %s inside the masked apps tree "
+                "(%s). That app's data stays masked for this spawn; every other app and "
+                "the spawn itself are unaffected.",
+                safe_terminal_line(entry.name),
+                safe_terminal_line(str(exc)),
+            )
+            continue
+        # Identity, taken HERE rather than by a later caller: the window travels onward as
+        # a pathname, and the child re-resolves that name in its own process. ``O_NOFOLLOW``
+        # settles a LINK planted at the name and nothing else -- a real directory RENAMED
+        # onto it opens and pins cleanly -- so the child needs the inode this approval was
+        # about. A second lookup from anywhere else would read whatever sits there by then,
+        # which is exactly the substitute; reading it in the same act as the approval is
+        # what makes the comparison mean anything. ``lstat`` on the descriptor's own path
+        # right after the create, and a window whose identity cannot be read is withheld
+        # rather than passed on unverifiable.
+        try:
+            window_stat = os.lstat(window)
+        except OSError as exc:
+            logger.debug(
+                "no data window for %s: its identity could not be read (%s)",
+                safe_terminal_line(entry.name),
+                safe_terminal_line(str(exc)),
+            )
+            continue
+        windows.append(AppDataWindow(window, window_stat.st_dev, window_stat.st_ino))
+    return tuple(windows)
 
 
 def _first_linked_component_below(root: str, leaf: str) -> str | None:
@@ -5925,8 +6243,10 @@ def _build_launcher_script(
     strip_python_env: bool = False,
     forward_ssh_auth_sock: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
+    extra_hidden_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
     extra_private_dirs: tuple[str, ...] = (),
+    extra_private_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_writable_dirs: tuple[str, ...] = (),
     extra_expose_files: tuple[str, ...] = (),
 ) -> str:
@@ -6058,7 +6378,27 @@ def _build_launcher_script(
     # without relying on how subpath treats a non-directory.
     dirs_json = json.dumps(list(dict.fromkeys(hidden_dirs)))
     readonly_json = json.dumps(list(dict.fromkeys(readonly_dirs)))
-    private_json = json.dumps(_private_window_spellings(extra_private_dirs, hidden_dirs))
+    private_json = json.dumps(
+        _private_window_spellings(extra_private_dirs, hidden_dirs, remasks_contained_targets=True)
+    )
+    # Identities the PRODUCER took when it approved each window, serialized and never
+    # re-derived: this function runs on the gateway's event loop, where
+    # ``test_the_builder_does_not_stat_the_hidden_paths`` forbids any filesystem probe,
+    # because one stat per path per async spawn blocks every session on a stalled network
+    # home. A window with no entry here is one whose producer supplied none, and the child
+    # treats it exactly as before -- so the callers that pass only paths are unchanged, and
+    # only a producer that vouches for an inode gets the stricter check.
+    private_ids_json = json.dumps({path: [dev, ino] for path, dev, ino in extra_private_dir_ids})
+    # Identities for MASK ROOTS, taken by the producer in the act that chose the name and
+    # serialized the same way and for the same reason. A mask root is carried by name, and
+    # the child masks whatever answers to that name: a real directory renamed onto it is
+    # masked in the original's place while the original stays readable at its new name,
+    # which the name alone cannot detect. An entry here binds the mask to one directory
+    # identity, and the child refuses the spawn when it cannot mask that identity --
+    # skipping is not available to a mask the way it is to a window, because a skipped
+    # mask leaves the tree exposed. A root with no entry keeps the plain name behaviour,
+    # so every caller that passes only names is unchanged.
+    hidden_ids_json = json.dumps({path: [dev, ino] for path, dev, ino in extra_hidden_dir_ids})
     # Write carve-outs: validated against the same seals this script
     # embeds. The launcher re-binds each approved directory over itself AFTER
     # the READONLY seal and remounts that bind read-write, so the carve-out
@@ -6280,7 +6620,9 @@ def _locked_mount_flags(target):
 REAL_UID = {uid}
 REAL_GID = {gid}
 SENSITIVE_DIRS = {dirs_json}
+SENSITIVE_DIR_IDS = {hidden_ids_json}
 PRIVATE_DIRS = {private_json}
+PRIVATE_DIR_IDS = {private_ids_json}
 READONLY_DIRS = {readonly_json}
 WRITABLE_DIRS = {writable_json}
 SENSITIVE_FILES = {files_json}
@@ -6439,17 +6781,116 @@ def main():
         # because the mask shadows the real path; the window is then bound
         # onto a placeholder created inside the parent's empty stand-in, so
         # every sibling stays hidden.
+        #
+        # Each window is PINNED before it is staged, and the bind source is the
+        # descriptor rather than the name. The parent validated this window by
+        # pathname, and the data home is writable by same-uid agent processes, so
+        # between that check and this bind another process can put a link where the
+        # window's own name, or ANY name below the mask, used to be -- a following
+        # bind would then stage the link's target and re-expose it read-write to the
+        # child. Every component from the window's masked root down is therefore
+        # opened descriptor-relative with O_NOFOLLOW, not just the leaf: a single
+        # O_NOFOLLOW open of the whole path refuses a link only at the last
+        # component, so a swapped ANCESTOR ("apps/alpha" made a link to
+        # "apps/aws-control") would still be traversed and its masked leaf staged.
+        # O_DIRECTORY refuses a non-directory in the same step, and
+        # /proc/self/fd/<n> resolves to the inode the descriptor already holds, so
+        # no name is resolved twice.
+        #
+        # The walk starts at the mask entry rather than at "/" because the crew data
+        # HOME is documented as allowed to be a symlink, and its own ancestors are
+        # not ours to police; the mask entry itself takes O_NOFOLLOW, which is the
+        # refusal the parent's own validation of that name mirrors. A window that
+        # cannot be pinned is SKIPPED, which leaves the parent's mask over the path
+        # -- the same fail-closed direction as the isdir skip this replaces.
+        def _pin_below_mask(root, leaf):
+            fd = os.open(root, os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY)
+            try:
+                for part in os.path.relpath(leaf, root).split(os.sep):
+                    if part in ("", ".", ".."):
+                        raise OSError("window path does not descend from its mask entry")
+                    nxt = os.open(part, os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY,
+                                  dir_fd=fd)
+                    os.close(fd)
+                    fd = nxt
+            except BaseException:
+                os.close(fd)
+                raise
+            return fd
+
         _private_stage = {{}}
         for p in PRIVATE_DIRS:
-            if os.path.isdir(p):
+            # The window's own mask entry, longest match: every PRIVATE_DIRS entry is
+            # a proper descendant of one, because both lists are built from the same
+            # hidden set, and the mask loop below re-opens a window only under the
+            # entry it matches.
+            _mask_root = ""
+            for _d in SENSITIVE_DIRS:
+                _d = _d.rstrip("/")
+                if p.startswith(_d + "/") and len(_d) > len(_mask_root):
+                    _mask_root = _d
+            if not _mask_root:
+                continue
+            try:
+                _win_fd = _pin_below_mask(_mask_root, p)
+            except (OSError, ValueError):
+                continue
+            try:
+                # ``O_NOFOLLOW`` at every component refuses a LINK planted at the name and
+                # settles nothing else: a real directory RENAMED onto an approved name
+                # opens and pins cleanly, and the vacated original then fails the mask
+                # loop's own isdir guard, so a substitute would be staged read-write AND
+                # take that tree's mask with it. The descriptor already holds the inode, so
+                # compare it with what the producer approved. A window whose producer
+                # supplied no identity keeps the earlier behaviour. A mismatch SKIPS the
+                # window, leaving the parent's mask over the path.
+                _want_id = PRIVATE_DIR_IDS.get(p)
+                if _want_id is not None:
+                    _win_st = os.fstat(_win_fd)
+                    if [_win_st.st_dev, _win_st.st_ino] != _want_id:
+                        continue
                 _stage_dir = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix)
-                _mount_or_die(p.encode(), _stage_dir.encode(), _MS_BIND,
+                _mount_or_die(("/proc/self/fd/%d" % _win_fd).encode(),
+                              _stage_dir.encode(), _MS_BIND,
                               "staging private window %s" % p)
                 _private_stage[p] = _stage_dir
+            finally:
+                os.close(_win_fd)
         # Bind-mount empty dirs over credential paths (per-dir tmpdir to
         # prevent content leaking across mounts via shared backing dir).
         for d in SENSITIVE_DIRS:
             target = d.encode()
+            # A mask root the producer vouched for must be the SAME directory here. The
+            # name is not enough: a same-UID process outside this child can rename a real
+            # directory onto it, and the mask then covers the substitute while the tree it
+            # was asked to hide stays readable at its new name. ``O_NOFOLLOW`` refuses a
+            # link at the name and says nothing about a rename, so compare the inode the
+            # descriptor already holds. Ancestors are resolved normally, because a data
+            # home reached through a symlink is a supported layout and the parent's own
+            # validation of this name resolves it the same way.
+            #
+            # A mismatch, and an absent name the producer saw as a directory, are both
+            # refusals rather than skips: this loop's skip leaves the tree unmasked, which
+            # is the exposure the identity exists to prevent. A root with no approved
+            # identity keeps the plain name behaviour below.
+            _want_dir_id = SENSITIVE_DIR_IDS.get(d)
+            if _want_dir_id is not None:
+                try:
+                    _mask_fd = os.open(d, os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY)
+                except OSError as exc:
+                    sys.exit(
+                        "sandbox: BLOCKED -- cannot open approved mask root %s (%s)"
+                        % (d, exc.strerror)
+                    )
+                try:
+                    _mask_st = os.fstat(_mask_fd)
+                finally:
+                    os.close(_mask_fd)
+                if [_mask_st.st_dev, _mask_st.st_ino] != _want_dir_id:
+                    sys.exit(
+                        "sandbox: BLOCKED -- %s is not the directory this spawn approved "
+                        "for masking" % d
+                    )
             if os.path.isdir(target):
                 per_dir_empty = tempfile.mkdtemp(dir=_tmpfs_src, prefix=_src_prefix).encode()
                 _windows = [p for p in _private_stage
@@ -6462,6 +6903,25 @@ def main():
                 for p in _windows:
                     _mount_or_die(_private_stage[p].encode(), p.encode(), _MS_BIND,
                                   "opening private window %s" % p)
+                # A window may CONTAIN a masked leaf -- ``apps/meetings/data`` holds the
+                # masked ``apps/meetings/data/edits`` -- and the bind above just replaced
+                # the empty stand-in that covered it with the real tree. Re-apply those
+                # nested masks NOW, after the window, which is the ordering the gate
+                # relies on when it admits a containing window: applied before it, they
+                # land on a path the window then shadows and the leaf comes back live.
+                # Fresh empty dir per leaf, as the mask loop itself does.
+                for p in _windows:
+                    for _nested in SENSITIVE_DIRS:
+                        _nested = _nested.rstrip("/")
+                        if not _nested.startswith(p.rstrip("/") + "/"):
+                            continue
+                        if not os.path.isdir(_nested.encode()):
+                            continue
+                        _nested_empty = tempfile.mkdtemp(
+                            dir=_tmpfs_src, prefix=_src_prefix
+                        ).encode()
+                        _mount_or_die(_nested_empty, _nested.encode(), _MS_BIND,
+                                      "re-hiding nested masked directory %s" % _nested)
 
         # Exposed-but-read-only dirs (the governance cache): bind the real dir over
         # itself, then remount that bind MS_RDONLY. Both steps are load-bearing --
@@ -7005,8 +7465,10 @@ def namespace_argv(
     strip_python_env: bool = False,
     forward_ssh_auth_sock: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
+    extra_hidden_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
     extra_private_dirs: tuple[str, ...] = (),
+    extra_private_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_writable_dirs: tuple[str, ...] = (),
     extra_expose_files: tuple[str, ...] = (),
 ) -> list[str]:
@@ -7058,8 +7520,10 @@ def namespace_argv(
         strip_python_env=strip_python_env,
         forward_ssh_auth_sock=forward_ssh_auth_sock,
         extra_hidden_dirs=extra_hidden_dirs,
+        extra_hidden_dir_ids=extra_hidden_dir_ids,
         extra_visible_dirs=extra_visible_dirs,
         extra_private_dirs=extra_private_dirs,
+        extra_private_dir_ids=extra_private_dir_ids,
         extra_writable_dirs=extra_writable_dirs,
         extra_expose_files=extra_expose_files,
     )
@@ -7922,6 +8386,7 @@ def sandbox_exec_argv(
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
     extra_private_dirs: tuple[str, ...] = (),
+    extra_private_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_writable_dirs: tuple[str, ...] = (),
     extra_expose_files: tuple[str, ...] = (),
 ) -> tuple[list[str], str | None]:
@@ -7944,6 +8409,25 @@ def sandbox_exec_argv(
     # that does not exist yet — but an orphan already on disk needs sweeping here too.
     _sweep_legacy_md_notebook_temps()
 
+    # A caller that pins a window to an inode is asking for a guarantee this backend
+    # cannot make: a Seatbelt profile is path rules end to end, so the allow for a window
+    # names a MUTABLE pathname and a same-UID peer renaming an app onto it is read through
+    # that allow. The Linux child compares the descriptor it pinned; there is no seatbelt
+    # counterpart, and a rule that silently granted the window anyway would advertise an
+    # enforcement that is not there. Withhold those windows instead: the parent's mask stays
+    # over the path, which is the same fail-closed direction the enumeration takes for an
+    # app it cannot vouch for, and it costs that app's data view rather than a credential.
+    pinned = {path for path, _dev, _ino in extra_private_dir_ids}
+    if pinned:
+        unenforceable = tuple(w for w in extra_private_dirs if w in pinned)
+        if unenforceable:
+            logger.warning(
+                "SECURITY: withholding %d private window(s) on the seatbelt backend: their "
+                "caller pinned an inode, which a path-rule profile cannot enforce. The tree "
+                "stays masked for this spawn.",
+                len(unenforceable),
+            )
+        extra_private_dirs = tuple(w for w in extra_private_dirs if w not in pinned)
     profile = _build_seatbelt_profile(
         sandbox_level,
         extra_hidden_dirs=extra_hidden_dirs,
@@ -10489,8 +10973,10 @@ def wrap_argv(
     strip_python_env: bool = False,
     forward_ssh_auth_sock: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
+    extra_hidden_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
     extra_private_dirs: tuple[str, ...] = (),
+    extra_private_dir_ids: tuple[tuple[str, int, int], ...] = (),
     extra_writable_dirs: tuple[str, ...] = (),
     extra_expose_files: tuple[str, ...] = (),
     is_kiro_cli: bool | None = None,
@@ -10841,6 +11327,7 @@ def wrap_argv(
                     extra_hidden_dirs=extra_hidden_dirs,
                     extra_visible_dirs=extra_visible_dirs,
                     extra_private_dirs=extra_private_dirs,
+                    extra_private_dir_ids=extra_private_dir_ids,
                     extra_writable_dirs=extra_writable_dirs,
                     extra_expose_files=extra_expose_files,
                 )
@@ -10879,8 +11366,10 @@ def wrap_argv(
                 strip_python_env=strip_python_env,
                 forward_ssh_auth_sock=forward_ssh_auth_sock,
                 extra_hidden_dirs=extra_hidden_dirs,
+                extra_hidden_dir_ids=extra_hidden_dir_ids,
                 extra_visible_dirs=extra_visible_dirs,
                 extra_private_dirs=extra_private_dirs,
+                extra_private_dir_ids=extra_private_dir_ids,
                 extra_writable_dirs=extra_writable_dirs,
                 extra_expose_files=extra_expose_files,
             )
@@ -10912,6 +11401,7 @@ def wrap_argv(
                 extra_hidden_dirs=extra_hidden_dirs,
                 extra_visible_dirs=extra_visible_dirs,
                 extra_private_dirs=extra_private_dirs,
+                extra_private_dir_ids=extra_private_dir_ids,
                 extra_writable_dirs=extra_writable_dirs,
                 extra_expose_files=extra_expose_files,
             )

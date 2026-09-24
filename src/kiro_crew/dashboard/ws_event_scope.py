@@ -729,6 +729,76 @@ def _slot_visible(
     return False
 
 
+def persisted_replay_denial_reason(state: Any, slot_key: str, record: dict) -> str:
+    """``""`` when a persisted run may be replayed into *slot_key*, else the reason.
+
+    Companion to :func:`_subagent_visible` below, and it lives here for that
+    reason: that gate answers "may this app receive subagent events for this
+    slot" from the slot's CURRENT owner, which is the right question for a live
+    run and the wrong one for a run read back off disk. Slot keys are
+    caller-supplied and are not namespaced by app, so the key an app's run was
+    recorded under can later be created by a DIFFERENT app -- and the gate would
+    then admit the old run to the new owner. The run's own recorded app is the
+    missing half of the decision, so it is compared here.
+
+    Two refusals, not one, because they mean different things and an operator
+    reads the reason: ``slot_missing`` is the same reason the live gate gives when
+    no slot answers the key, which on a lazily hydrated slot is ordinary rather
+    than adversarial; ``persisted_owner_mismatch`` is a real cross-owner refusal.
+    Collapsing them would file every cold-start reconnect as a security event and
+    dilute the stream the real one has to be visible in.
+
+    Equality both ways, and fail closed. A run no app owns carries ``""``, which
+    matches only a slot no app owns, so an app never receives a person's run and
+    a person never receives an app's. ``get_slot`` is deliberate over a raw
+    ``_slots`` read: it also answers ``None`` for a slot still under
+    construction, and an admission decision must not be made against a
+    not-yet-finalized session.
+    """
+    if not slot_key:
+        return "slot_missing"
+    getter = getattr(state, "get_slot", None)
+    if callable(getter):
+        slot = getter(slot_key)
+    else:
+        slot = getattr(state, "_slots", {}).get(slot_key)
+    if slot is None:
+        return "slot_missing"
+    if str(getattr(slot, "_app", "") or "") != str(record.get("app") or ""):
+        return "persisted_owner_mismatch"
+    return ""
+
+
+def slot_owner_snapshot(state: object) -> dict[str, str]:
+    """Every live slot's current owning app, as a plain mapping.
+
+    Taken on the EVENT LOOP so an off-loop scan can size its row cap over the
+    records a socket may actually see, without that scan reading live state from
+    a worker thread. It is a snapshot and nothing more: the decision to deliver a
+    record is taken again on the loop by ``persisted_replay_denial_reason``,
+    because a slot's owner can be reclaimed while the scan runs.
+    """
+    slots = dict(getattr(state, "_slots", {}) or {})
+    return {key: str(getattr(slot, "_app", "") or "") for key, slot in slots.items()}
+
+
+def persisted_snapshot_admits(snapshot: dict[str, str], slot_key: str, record: object) -> bool:
+    """Whether a snapshot of slot owners would admit this record.
+
+    The same equality, fail-closed both ways, that the authoritative check
+    applies -- a slot the snapshot does not hold is refused rather than assumed
+    absent-and-therefore-harmless. Its answer governs only the cap: admitting a
+    foreign record here would spend a slot the caller's own runs need, and
+    counting one would disclose how many foreign runs exist.
+    """
+    if not slot_key or slot_key not in snapshot:
+        return False
+    getter = getattr(record, "get", None)
+    if not callable(getter):
+        return False
+    return snapshot[slot_key] == str(getter("app") or "")
+
+
 def _subagent_visible(
     slot: _ChatSlot,
     app: str,

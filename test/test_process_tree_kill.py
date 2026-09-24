@@ -18,9 +18,17 @@ from kiro_crew.subagent import SubagentManager
 
 
 def _make_provider(
-    pid: int, child_pids: dict[int, int | None] | None = None, start_time: int | None = 100
+    pid: int,
+    child_pids: dict[int, int | None] | None = None,
+    start_time: int | str | None = 100,
 ):
-    """Create a mock provider with a _client that has _pid, _child_pids, _start_time."""
+    """Create a mock provider with a _client that has _pid, _child_pids, _start_time.
+
+    The real client records ``_start_time`` as the string
+    ``platform_compat.get_process_start_id`` returns; the subagent kill tests
+    pass one, the session-reset tests below keep the int their child verifier
+    compares.
+    """
     provider = AsyncMock()
     provider.start = AsyncMock()
     provider.shutdown = AsyncMock()
@@ -175,16 +183,36 @@ class TestResetProcessTreeKill:
 
 # ── subagent._sigkill_session() tests ──
 
+# The start id the fake client records at spawn (``platform_compat.get_process_start_id``
+# reads ``/proc/<pid>/stat`` field 22 on Linux); the kill re-reads it before signalling.
+_START_ID = "4821903"
+
+
+def _subagent_handle(mgr: SubagentManager, session_key: str):
+    """The kill handle the teardown paths take before their reset and hand to the kill."""
+    handle = mgr._retain_process_handle(session_key.removeprefix("subagent:"), session_key)
+    assert handle is not None, f"no session registered under {session_key}"
+    return handle
+
 
 class TestSigkillSessionProcessTree:
-    """Tests for SubagentManager._sigkill_session() process tree cleanup."""
+    """Tests for SubagentManager._sigkill_session() process tree cleanup.
+
+    The kill acts on the handle its caller took BEFORE the reset (pid, recorded
+    start id, recorded children) and never reads the session map; it returns
+    None once the group has been signalled or there was nothing to kill, and
+    the failure otherwise.
+    """
 
     def _make_manager(
-        self, pid: int, child_pids: dict[int, int | None] | None = None, start_time: int | None = 100
+        self,
+        pid: int,
+        child_pids: dict[int, int | None] | None = None,
+        start_time: str | None = _START_ID,
     ):
         provider = _make_provider(pid, child_pids, start_time=start_time)
         sessions = _mock_sessions_with_provider(provider)
-        # Put a session in the internal dict so _sigkill_session can find it
+        # Put a session in the internal dict so the pre-reset handle can be taken
         mock_session = MagicMock()
         mock_session.provider = provider
         sessions._sessions = {"subagent:test1": mock_session}
@@ -212,11 +240,14 @@ class TestSigkillSessionProcessTree:
             patch("kiro_crew.subagent.os.getpgid", return_value=54321),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
             patch("kiro_crew.acp.client._kill_escaped_children") as mock_sweep,
-            patch("kiro_crew.platform_compat.get_process_start_id", return_value=100),
-            patch("kiro_crew.acp.client._is_our_child", return_value=True),
+            patch("kiro_crew.platform_compat.pid_exists", return_value=True),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value=_START_ID),
         ):
-            await mgr._sigkill_session("subagent:test1")
+            result = await mgr._sigkill_session(
+                "subagent:test1", _subagent_handle(mgr, "subagent:test1")
+            )
 
+        assert result is None
         mock_killpg.assert_called_once_with(54321, signal.SIGKILL)
         mock_sweep.assert_called_once()
 
@@ -231,11 +262,14 @@ class TestSigkillSessionProcessTree:
             patch("kiro_crew.subagent.os.getpgid", return_value=54321),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
             patch("kiro_crew.acp.client._kill_escaped_children"),
-            patch("kiro_crew.platform_compat.get_process_start_id", return_value=100),
-            patch("kiro_crew.acp.client._is_our_child", return_value=True),
+            patch("kiro_crew.platform_compat.pid_exists", return_value=True),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value=_START_ID),
         ):
-            await mgr._sigkill_session("subagent:test1")
+            result = await mgr._sigkill_session(
+                "subagent:test1", _subagent_handle(mgr, "subagent:test1")
+            )
 
+        assert result is None
         mock_kill.assert_called_once_with(54321, signal.SIGKILL)
 
     @pytest.mark.asyncio
@@ -247,12 +281,12 @@ class TestSigkillSessionProcessTree:
             patch("kiro_crew.subagent.os.killpg"),
             patch("kiro_crew.subagent.os.getpgid", return_value=54321),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[54323]),
-            patch("kiro_crew.platform_compat.get_process_start_id", return_value=200),
+            patch("kiro_crew.platform_compat.pid_exists", return_value=True),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value=_START_ID),
             patch("kiro_crew.acp.client._read_basename", return_value=b"node"),
-            patch("kiro_crew.acp.client._is_our_child", return_value=True),
             patch("kiro_crew.acp.client._kill_escaped_children") as mock_sweep,
         ):
-            await mgr._sigkill_session("subagent:test1")
+            await mgr._sigkill_session("subagent:test1", _subagent_handle(mgr, "subagent:test1"))
 
         # Sweep should receive merged dict: stored 54322 + fresh 54323
         swept = mock_sweep.call_args[0][0]
@@ -261,18 +295,24 @@ class TestSigkillSessionProcessTree:
 
     @pytest.mark.asyncio
     async def test_sigkill_skips_killpg_on_recycled_pid(self):
-        """_sigkill_session skips killpg but sweeps stored children when PID recycled."""
+        """_sigkill_session skips killpg but sweeps stored children when PID recycled.
+
+        Recycling is read off the root's start id: a live reading that differs
+        from the one the client recorded means another process owns the pid.
+        """
         mgr = self._make_manager(pid=54321, child_pids={54322: 100})
 
         with (
             patch("kiro_crew.subagent.os.killpg") as mock_killpg,
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
-            patch("kiro_crew.platform_compat.get_process_start_id", return_value=100),
-            patch("kiro_crew.acp.client._is_our_child", return_value=False),
+            patch("kiro_crew.platform_compat.get_process_start_id", return_value="9999999"),
             patch("kiro_crew.acp.client._kill_escaped_children") as mock_sweep,
         ):
-            await mgr._sigkill_session("subagent:test1")
+            result = await mgr._sigkill_session(
+                "subagent:test1", _subagent_handle(mgr, "subagent:test1")
+            )
 
+        assert result is None, "a recycled pid is nothing to kill, not a failure"
         mock_killpg.assert_not_called()
         mock_sweep.assert_called_once()
         assert 54322 in mock_sweep.call_args[0][0]  # stored children swept
@@ -286,16 +326,20 @@ class TestSigkillSessionProcessTree:
             patch("kiro_crew.subagent.os.killpg") as mock_killpg,
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
             patch("kiro_crew.platform_compat.get_process_start_id", return_value=None),
+            patch("kiro_crew.platform_compat.pid_exists", return_value=False),
             patch("kiro_crew.acp.client._kill_escaped_children") as mock_sweep,
         ):
-            await mgr._sigkill_session("subagent:test1")
+            result = await mgr._sigkill_session(
+                "subagent:test1", _subagent_handle(mgr, "subagent:test1")
+            )
 
+        assert result is None
         mock_killpg.assert_not_called()
         mock_sweep.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_sigkill_noop_when_no_session(self):
-        """_sigkill_session returns early when session not found."""
+        """_sigkill_session returns early when no session was live before the reset."""
         sessions = MagicMock()
         sessions._sessions = {}
         mgr = SubagentManager(
@@ -307,8 +351,10 @@ class TestSigkillSessionProcessTree:
         )
 
         with patch("kiro_crew.subagent.os.killpg") as mock_killpg:
-            await mgr._sigkill_session("subagent:nonexistent")
+            assert mgr._retain_process_handle("nonexistent", "subagent:nonexistent") is None
+            result = await mgr._sigkill_session("subagent:nonexistent", None)
 
+        assert result is None, "no session before the reset is nothing to kill, not a failure"
         mock_killpg.assert_not_called()
 
     @pytest.mark.asyncio
@@ -330,6 +376,9 @@ class TestSigkillSessionProcessTree:
         )
 
         with patch("kiro_crew.subagent.os.killpg") as mock_killpg:
-            await mgr._sigkill_session("subagent:test1")
+            result = await mgr._sigkill_session(
+                "subagent:test1", _subagent_handle(mgr, "subagent:test1")
+            )
 
+        assert result is None
         mock_killpg.assert_not_called()

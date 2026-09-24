@@ -52,6 +52,7 @@ if TYPE_CHECKING:
         SubagentInfo,
         _context_groups_of,
         _describe_exception,
+        _process_survived,
         _redact,
         _resolved_model_of,
         _subagent_default_effort,
@@ -387,29 +388,67 @@ class RunEventCoordinator(ManagerComponent):
         except Exception:
             logger.warning("Subagent %s: release failed", info.id, exc_info=True)
         if not info._session_sharing:
+            # Taken BEFORE the reset and RETAINED under the run's id: the reset
+            # pops the session from the map before the awaits that can hang,
+            # and this teardown is the reset that commonly hangs while the
+            # reaper (a deadline, a user Stop) arrives to act on it -- the
+            # reaper finds the map empty and reads this entry instead. On a map
+            # miss here the roles are reversed and the entry is the reaper's.
+            handle = self._manager._retain_process_handle(info.id, session_key)
+            kill_failed: str | None = None
+            fallback_ran = False
             try:
-                await asyncio.wait_for(
-                    self._manager._sessions.reset(session_key), timeout=_RESET_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Subagent %s: reset timed out, force-killing", info.id)
-                await self._manager._sigkill_session(session_key)
                 try:
-                    sel().log_tool_invocation(
-                        session_key=session_key,
-                        source="subagent",
-                        tool_name="run_finally_force_kill",
-                        outcome="sigkill",
-                        metadata={"subagent_id": info.id},
+                    await asyncio.wait_for(
+                        self._manager._sessions.reset(session_key), timeout=_RESET_TIMEOUT
                     )
+                except asyncio.TimeoutError:
+                    logger.warning("Subagent %s: reset timed out, force-killing", info.id)
+                    fallback_ran = True
+                    kill_failed = await self._manager._sigkill_session(session_key, handle)
                 except Exception:
-                    logger.exception("Subagent %s: SEL audit failed", info.id)
-            except Exception:
-                logger.exception("Subagent %s: reset failed", info.id)
+                    logger.exception("Subagent %s: reset failed, force-killing", info.id)
+                    fallback_ran = True
+                    kill_failed = await self._manager._sigkill_session(session_key, handle)
+                else:
+                    # A completed reset (True, or False for a key the reaper had
+                    # already popped) is not proof the process is gone; the
+                    # handle is asked, and a process still standing gets the
+                    # fallback (see ``_force_reap``).
+                    if handle is not None and _process_survived(handle):
+                        logger.warning(
+                            "Subagent %s: process survived the reset, force-killing", info.id
+                        )
+                        fallback_ran = True
+                        kill_failed = await self._manager._sigkill_session(session_key, handle)
+                if fallback_ran:
+                    try:
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            source="subagent",
+                            tool_name="run_finally_force_kill",
+                            # Never ``sigkill`` for a process the kill left
+                            # alive; the failure it reported is the record's
+                            # error text -- this run's own record is already
+                            # written, so the audit row is where it lives.
+                            outcome="sigkill" if kill_failed is None else "failed",
+                            error=kill_failed or "",
+                            metadata={"subagent_id": info.id},
+                        )
+                    except Exception:
+                        logger.exception("Subagent %s: SEL audit failed", info.id)
+            finally:
+                # Decided (or cancelled out from under -- by the reaper, which
+                # consumed the entry before cancelling this task).
+                self._manager._process_handles.pop(info.id, None)
 
     async def _run_impl(self, info: SubagentInfo) -> None:
         """Execute a subagent task in its own session."""
         session_key = info.conversation_key or f"subagent:{info.id}"
+        # Set by the reap-echo arm below: the run ended because a reap in
+        # flight tore its runtime down, and that reap publishes the terminal
+        # report once its kill has decided (see the ``finally``).
+        reap_owns_report = False
         try:
             await asyncio.wait_for(
                 self._manager._run_inner(info, session_key), timeout=self._manager._default_timeout
@@ -511,6 +550,15 @@ class RunEventCoordinator(ManagerComponent):
                 # is what wins the first-arrival record over the reaper's own
                 # synthesis (guard 1 in ``_force_reap``), so the whole record --
                 # error, stat, tombstone -- is written HERE, as it was before.
+                # The REPORT is not: this arm runs while the reap still awaits
+                # its reset or the fallback kill that follows it, so publishing
+                # from this task's ``finally`` told the parent the run was
+                # reaped before the kill had decided, and a failure the
+                # fallback then reported changed only the in-memory error
+                # text. The reap claims the report after its kill has decided
+                # (``supersede_recovery=True``), with the failure appended and
+                # the tombstone re-written -- so it is left to the reap.
+                reap_owns_report = True
                 origin = info._stop_origin or "the reaper"
                 if not info.done:
                     # Neutrality follows the FIRST stopper. A Stop that lands
@@ -572,7 +620,15 @@ class RunEventCoordinator(ManagerComponent):
             # from _agents AND _tasks, and it still must not tombstone a child that
             # is being killed.
             self._manager._teardown_gates[info.id] = teardown_done
-            if self._manager._claim_finalize(info):
+            if reap_owns_report:
+                # The reap-echo arm ran: the reap that tore the runtime down
+                # publishes the report once its kill has decided (its claim
+                # supersedes). The run still owns its cost sample, which the
+                # claim branch below would otherwise have recorded; the reap's
+                # own record guard is skipped for a record this arm wrote.
+                info.elapsed = time.time() - info.started
+                self._manager._record_cost(info)
+            elif self._manager._claim_finalize(info):
                 info.elapsed = time.time() - info.started
                 self._manager._record_cost(info)
                 report_task = self._manager._spawn_terminal_report(

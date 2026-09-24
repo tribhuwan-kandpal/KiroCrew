@@ -536,6 +536,107 @@ _STEER_STARTUP_POLL_SECS = 0.5
 # latency is irrelevant next to permanent wedging.
 _WAVE_STUCK_SECS = 1800
 _RESET_TIMEOUT = 30.0  # max seconds for session reset in finally block
+
+
+@dataclass(frozen=True)
+class _ProcessHandle:
+    """What a force-stop needs of a run's session process, taken BEFORE the reset.
+
+    ``SessionLifecycle.reset`` pops the session out of the session map under its
+    lock before the awaits that can hang (the end record, the unlink, the child
+    probes, the provider shutdown), so once ``wait_for(reset)`` has timed out the
+    map does not name the process the reset could not stop. A kill that looks
+    the session up afterwards finds nothing, and without this handle it would
+    call a still-running process nothing to stop. The handle is the pid the
+    client recorded at spawn, the start id it read for that pid then
+    (:func:`platform_compat.get_process_start_id`, the recycling detector the
+    kill re-reads before it signals), and the child records it had accumulated,
+    read from the live client while the map still held the session.
+
+    Retained in ``SubagentManager._process_handles`` under the run's id by
+    whichever teardown path reaches the reset first (see
+    :meth:`SubagentManager._retain_process_handle`): the run's own ``finally``
+    and the reaper both reset the same session, and the one that arrives while
+    the other's reset is hanging finds the map already empty.
+    """
+
+    pid: int | None
+    start_id: str | None
+    child_pids: dict[Any, Any]
+
+
+def _process_handle_of(session: Any) -> _ProcessHandle:
+    """Read the kill handle off a live session's ACP client (no syscalls)."""
+    client = getattr(session.provider, "_client", None)
+    raw_pid = getattr(client, "_pid", None) if client else None
+    raw_start = getattr(client, "_start_time", None) if client else None
+    raw_children = getattr(client, "_child_pids", None) if client else None
+    return _ProcessHandle(
+        pid=raw_pid if isinstance(raw_pid, int) and raw_pid > 1 else None,
+        start_id=raw_start if isinstance(raw_start, str) else None,
+        child_pids=dict(raw_children) if isinstance(raw_children, dict) else {},
+    )
+
+
+def _process_survived(handle: _ProcessHandle) -> bool:
+    """Whether the process ``handle`` names may still be standing after a reset.
+
+    A reset that completed is not proof the process is gone: its own shutdown
+    can fail without raising out of it, and one that answered ``False`` found
+    no session and stopped nothing. So the callers ask the process itself,
+    the way ``_sigkill_session`` will, and it must pass BOTH readings to count
+    as standing: the process must exist, and the start id read for its pid
+    must match the one the handle recorded. Either failing is gone -- no
+    usable pid, no process behind the pid, or a start id that differs from the
+    recorded one (the pid is another process's now; never signalled).
+
+    Existence is asked FIRST, through :func:`platform_compat.pid_exists`,
+    which on Windows is the exit-code-confirmed probe (``OpenProcess`` +
+    ``GetExitCodeProcess``), because an identity-only comparison bypasses it:
+    a start id reads back for an EXITED Windows process as long as any handle
+    to its kernel object is still open (asyncio's Proactor transport keeps one
+    until GC), so comparing start ids alone reported "alive" for a process
+    the OS had already confirmed exited, and the fallback then signalled a
+    dead pid and recorded the error as a failed kill.
+
+    A process that exists but whose identity cannot be read, or one the
+    client recorded no start id for, is not proven gone: it still stands for
+    this check, and the kill then decides -- it does not signal an unverified
+    pid, and reports that as its failure.
+    """
+    pid = handle.pid
+    if not pid:
+        return False
+    if not platform_compat.pid_exists(pid):
+        return False
+    actual_start = platform_compat.get_process_start_id(pid)
+    if actual_start is None:
+        return True
+    return handle.start_id is None or actual_start == handle.start_id
+
+
+def _teardown_failure(exc: BaseException) -> str:
+    """Name the failure a force-stop's kill raised, for the run's record.
+
+    ``Type: detail``, the exception alone -- not :func:`_describe_exception`'s
+    context chain, which here would append the ``TimeoutError`` of the reset
+    the fallback ran under as a "cause" of a refusal it did not cause. Same
+    shape as the cron reaper's namer, so the two audit trails read alike.
+    """
+    detail = str(exc)
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+
+def _with_kill_failure(error: str, kill_failed: str) -> str:
+    """The run's error text with the force-stop's reported failure appended.
+
+    Same suffix the cron reaper writes into a job's ``last_error``
+    (``…; kill failed: <reason>``), so the two audit trails read alike.
+    """
+    suffix = f"kill failed: {kill_failed}"
+    return f"{error}; {suffix}" if error else suffix
+
+
 _RECOVERY_SLOT_WAIT_SECS = 60.0
 _REPORT_DRAIN_TIMEOUT = (
     30.0  # max seconds cancel_all() waits for shielded terminal reports to drain
@@ -2652,6 +2753,16 @@ class SubagentManager:
         # makes that inference unnecessary. Removed by the same ``finally`` that sets
         # the event, so a missing entry always means "nothing left to wait for".
         self._teardown_gates: dict[str, asyncio.Event] = {}
+        #: run id -> the kill handle of its session process, RETAINED across the
+        #: reset that pops the session from the map (see :class:`_ProcessHandle`).
+        #: Written by :meth:`_retain_process_handle` from whichever teardown path
+        #: reaches the reset first -- the run's own ``finally`` or the reaper --
+        #: and read by the other on a session-map miss, so a force-stop that
+        #: arrives while the first reset is hanging can still name, verify and
+        #: signal the process. Cleared when the path that holds it has decided
+        #: (the handle was consumed by the kill, or the survivor check found the
+        #: process gone); an entry that outlives its run is one small record.
+        self._process_handles: dict[str, _ProcessHandle] = {}
         #: parent session key -> event pulsed whenever one of its runs reaches a
         #: terminal report. Created on demand by :meth:`completion_event` and
         #: dropped by :meth:`release_completion_event`, so the only entries are
@@ -3719,8 +3830,11 @@ class SubagentManager:
     ) -> None:
         return await self._terminal._force_reap_impl(agent_id, info, elapsed, reason=reason)
 
-    async def _sigkill_session(self, session_key: str) -> None:
-        return await self._terminal._sigkill_session_impl(session_key)
+    async def _sigkill_session(self, session_key: str, handle: _ProcessHandle | None) -> str | None:
+        return await self._terminal._sigkill_session_impl(session_key, handle)
+
+    def _retain_process_handle(self, agent_id: str, session_key: str) -> _ProcessHandle | None:
+        return self._terminal._retain_process_handle_impl(agent_id, session_key)
 
     def notify_injection_failed(
         self, info: SubagentInfo, reason: str = "delivery timed out"

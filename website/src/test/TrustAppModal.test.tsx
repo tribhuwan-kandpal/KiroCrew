@@ -84,6 +84,7 @@ import AppDetailPage from '../pages/AppDetailPage'
 import {
   isTrustDeniedError,
   isSessionApprovalConsentRequiredError,
+  retryFailureDetail,
   APP_EXECUTION_DENIED,
   SESSION_APPROVAL_CONSENT_REQUIRED,
   credentialFreeRepository,
@@ -629,6 +630,62 @@ describe('registry install trust gate', () => {
     await waitFor(() => expect(modalTitle()).toBeNull())
     expect(trustApp).not.toHaveBeenCalled()
     expect(installFromRegistryStream).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows the server reason under the headline when the retried install fails', async () => {
+    // REGRESSION (#13446): the modal showed `failed_generic` alone and discarded
+    // the install stream's error, so a desktop user hit the same dead end on every
+    // Try again with the cause visible only in `security_events.jsonl`. The
+    // headline stays — it carries the "nothing was changed" advice — and the raw
+    // server sentence is the notice's own message, so the agent hand-off keeps it.
+    const refusal = 'Python apps that require a build step are not supported in the desktop app'
+    installFromRegistryStream
+      .mockResolvedValueOnce(INSTALL_DENIED())
+      .mockResolvedValue({ ok: false, name: THIRD_PARTY.name, error: refusal })
+    getApp.mockRejectedValue(apiError(404, { error: 'app not installed' }))
+    renderDetailFromGet()
+    await waitFor(() => expect(modalTitle()).toBeTruthy())
+
+    fireEvent.click(confirmBtn())
+
+    await waitFor(() => {
+      const alert = within(screen.getByRole('dialog')).getByRole('alert').textContent
+      expect(alert).toContain(refusal)
+      expect(alert).toContain(`${K}.failed_generic LaunchDarkly`)
+    })
+  })
+
+  it('never renders the trust-denied CODE as the reason', async () => {
+    // A second refusal rejects with `app_execution_denied` as a sentinel, not as
+    // user-facing text; the modal's own copy explains a grant that did not take
+    // effect. Showing the machine code would be a worse dead end than the generic
+    // message it replaced.
+    installFromRegistryStream.mockResolvedValue(INSTALL_DENIED())
+    renderDetailFromGet()
+    await waitFor(() => expect(modalTitle()).toBeTruthy())
+    getApp.mockRejectedValue(apiError(500, { error: 'gateway exploded' }, 'gateway exploded'))
+
+    fireEvent.click(confirmBtn())
+
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed LaunchDarkly`))
+    expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .not.toContain(APP_EXECUTION_DENIED)
+  })
+})
+
+describe('retryFailureDetail', () => {
+  it('lifts the failure message and drops what is not user-facing', () => {
+    expect(retryFailureDetail(new Error('  git clone exploded  '))).toBe('git clone exploded')
+    expect(retryFailureDetail('plain string failure')).toBe('plain string failure')
+    // A machine code is not a reason to show.
+    expect(retryFailureDetail(new Error(APP_EXECUTION_DENIED))).toBe('')
+    expect(retryFailureDetail(TRUST_DENIED())).toBe('')
+    expect(retryFailureDetail(INSTALL_DENIED())).toBe('')
+    // Nothing to show rather than an empty detail beside the headline.
+    expect(retryFailureDetail(new Error('   '))).toBe('')
+    expect(retryFailureDetail(undefined)).toBe('')
+    expect(retryFailureDetail({ ok: false })).toBe('')
   })
 })
 

@@ -6212,9 +6212,15 @@ async def _clone_build_app_locked(
     # manifest at clone time, and under a require-signature policy that content
     # must not build or install. Same fail-closed policy call, different
     # artifact.
+    # The typed view, built ONCE: the admission gate below and the build's
+    # desktop gate must judge the same normalized manifest the runtime later
+    # loads from (`manager.py` hands the hook loaders
+    # `AppManifest.from_json_file(...).to_dict()`), so a second, differently
+    # normalized reading of these bytes is exactly the disagreement to avoid.
+    cloned_app_manifest = AppManifest.from_dict(cloned_manifest)
     denied = app_admission_denied(
         app_name,
-        manifest=AppManifest.from_dict(cloned_manifest),
+        manifest=cloned_app_manifest,
         action="install_from_registry",
     )
     if denied:
@@ -6259,7 +6265,13 @@ async def _clone_build_app_locked(
     # `app_source` is already the containment-checked join of `subdirectory`
     # under the clone root (the identity gate above fails closed on an escaping
     # value), so it is safe to run the build command there.
-    result = await _run_app_build(app_source, app_name, log_lines)
+    #
+    # `cloned_app_manifest` is the manifest the identity and admission gates just
+    # judged — passed rather than re-read so the build decides from the bytes
+    # those gates accepted, normalized once, the way the runtime's loaders see it.
+    result = await _run_app_build(
+        app_source, app_name, log_lines, manifest=cloned_app_manifest
+    )
     if result["ok"]:
         result["pkg_dir"] = pkg_dir
         # Surface the pre-clone checkout state so the caller's LATER gates
@@ -6336,10 +6348,55 @@ async def _clone_build_app_locked(
     return result
 
 
+def _requirements_owned_by_the_runtime(manifest: AppManifest) -> bool:
+    """True when the runtime provisions this app's root ``requirements.txt`` out
+    of process and nothing of the app's Python imports into the gateway.
+
+    This is the RUNTIME'S OWN condition, mirrored rather than approximated. Two
+    paths install that file with ``pip install --target`` into the app's own deps
+    dir — a tree that reaches processes spawned on the app's behalf and is
+    deliberately never placed on the gateway's import path:
+
+    - ``apps/backend.py::provision_app_deps`` at the spawn of a declared
+      ``backend.entryPoint``;
+    - ``apps/bridges.py::_maybe_provision_backendless_deps`` at registration,
+      for an app that ships a stdio ``mcpServers`` entry (an entry WITHOUT
+      ``url``; a ``url`` server is remote and spawns nothing).
+
+    Either is an out-of-process consumer. Neither helps a declared
+    ``backend.hooks`` field: a hook is imported INTO the gateway process
+    (``lifecycle.py``, ``route_registry.py``), which the deps tree never reaches,
+    so an app declaring one has Python that must import from the gateway's
+    interpreter after all — waiving for it would install the app "successfully"
+    with its hook imports broken and its routes degraded, the silent-broken
+    install the loud refusal exists to prevent.
+
+    Answers from the TYPED manifest, which is what decides what actually loads:
+    ``manager.py`` hands the loaders ``AppManifest.from_json_file(...).to_dict()``,
+    so a declaration ``BackendConfig.from_dict`` normalizes away is a hook the
+    loaders never see either, and ``bridges.py`` reads ``manifest.mcpServers`` from
+    the same typed object.
+    """
+    backend = manifest.backend
+    # `hooks.to_dict()` omits every blank field, so an empty dict IS "declares no
+    # in-gateway hook", in the same emission the loaders are fed.
+    if backend.hooks.to_dict():
+        return False
+    if backend.entryPoint.strip():
+        return True
+    # Same test `bridges.py` runs before it provisions: a stdio server is an
+    # entry with no `url`.
+    return any(
+        isinstance(cfg, dict) and not cfg.get("url") for cfg in manifest.mcpServers.values()
+    )
+
+
 async def _run_app_build(
     build_dir: Path,
     app_name: str,
     log_lines: list[str],
+    *,
+    manifest: AppManifest,
 ) -> dict[str, Any]:
     """Build a cloned app using a sensible default for its ecosystem.
 
@@ -6350,6 +6407,15 @@ async def _run_app_build(
         ``setup.py`` /
         ``requirements.txt``  → ``pip install .`` (or ``-r requirements.txt``)
       - otherwise             → no build step (source is used as-is)
+
+    *manifest* is the CLONED ``app.json``, typed — the same object the admission
+    gate judged, and normalized the way the runtime's own loaders see it. It
+    decides one thing only: whether a bundled interpreter may pass a
+    requirements-only app through to the runtime's own provisioning (see
+    :func:`_requirements_owned_by_the_runtime`). Required rather than
+    defaulted, so a caller states what the app declares instead of inheriting a
+    verdict; an empty ``AppManifest`` is the honest value for "declares nothing",
+    and it refuses.
 
     The app's own ``setup.onInstall`` script (run later by
     ``install_from_registry``) can perform any additional steps.  A missing
@@ -6412,16 +6478,53 @@ async def _run_app_build(
         # platform_compat.is_bundled_interpreter() — the single owner of the
         # packaging-layout sentinel — so a bundler rename breaks its pinned test
         # instead of silently un-matching an inline check here.
+        #
+        # What that refusal is ABOUT is the gateway's own import path, so it
+        # applies to what would have to land there: `pyproject.toml` / `setup.py`
+        # install INTO this interpreter (`pip install .`). A root requirements.txt
+        # the RUNTIME provisions out of process is a different dependency:
+        # `backend.py::provision_app_deps` (at the spawn of a `backend.entryPoint`)
+        # and `bridges.py::_maybe_provision_backendless_deps` (at the
+        # registration of a stdio `mcpServers` entry) both install that same file
+        # with `pip install --target` into the app's own deps dir, which works on
+        # the bundled interpreter and never touches the bundle. Refusing it here
+        # would block exactly the app classes the runtime serves, so it passes
+        # the gate and NOTHING is pip-installed at install time — the runtime owns
+        # it. This is a capability check that matches what the runtime can do,
+        # not a widening of any boundary: the same file, on the same
+        # interpreter, is already provisioned by the runtime.
+        #
+        # The waiver is the runtime's own condition, mirrored in
+        # `_requirements_owned_by_the_runtime`: an out-of-process consumer is
+        # declared (entry point, or a stdio server — one without `url`) AND no
+        # `backend.hooks` field is, because a hook is imported INTO this process,
+        # which the app deps tree deliberately never reaches.
+        #
+        # requirements.txt BESIDE pyproject.toml/setup.py keeps the refusal (the
+        # non-bundled branch below runs `pip install .` for that layout, so the
+        # gateway-import dependency is the one that decides), and a
+        # requirements.txt with NO out-of-process consumer keeps it too — nothing
+        # would provision it, so a pass would be the silent-broken install.
         if platform_compat.is_bundled_interpreter():
-            return {
-                "ok": False,
-                "name": app_name,
-                "error": (
-                    "Python apps that require a build step are not supported in "
-                    "the desktop app: its bundled interpreter is inside the "
-                    "signed application bundle and cannot install packages"
-                ),
-            }
+            gateway_import_needed = (build_dir / "pyproject.toml").is_file() or (
+                build_dir / "setup.py"
+            ).is_file()
+            if gateway_import_needed or not _requirements_owned_by_the_runtime(manifest):
+                return {
+                    "ok": False,
+                    "name": app_name,
+                    "error": (
+                        "Python apps that require a build step are not supported in "
+                        "the desktop app: its bundled interpreter is inside the "
+                        "signed application bundle and cannot install packages"
+                    ),
+                }
+            log_lines.append(
+                "requirements.txt is provisioned at runtime into this app's own deps "
+                "directory (for its backend entry point or stdio MCP server), so no "
+                "install-time pip step runs on the bundled interpreter"
+            )
+            return {"ok": True}
         # A missing `pip` module is a soft skip, exactly like a missing npm
         # (see the docstring). `sys.executable` is the gateway interpreter, and a
         # venv created with `--without-pip` — or any minimal runtime — has no `pip`

@@ -39,6 +39,7 @@ import pytest
 
 from kiro_crew import platform_compat
 from kiro_crew.apps import registry
+from kiro_crew.apps.manifest import AppManifest
 
 
 @pytest.fixture(autouse=True)
@@ -3247,7 +3248,7 @@ async def test_python_build_uses_the_running_interpreter_not_path_pip(tmp_path, 
     # A PATH pip that is emphatically not us — the old code would have used it.
     monkeypatch.setattr(registry.shutil, "which", lambda name: f"/usr/bin/{name}")
 
-    await registry._run_app_build(tmp_path, "x", [])
+    await registry._run_app_build(tmp_path, "x", [], manifest=AppManifest.from_dict({}))
 
     assert captured, "a pyproject.toml must produce a build command"
     argv = captured[0]
@@ -3288,7 +3289,9 @@ async def test_python_build_soft_skips_when_the_interpreter_has_no_pip(tmp_path,
 
     monkeypatch.setattr(registry.importlib.util, "find_spec", _no_pip)
 
-    result = await registry._run_app_build(tmp_path, "x", log_lines)
+    result = await registry._run_app_build(
+        tmp_path, "x", log_lines, manifest=AppManifest.from_dict({})
+    )
 
     assert result == {"ok": True}, f"a pip-less interpreter must soft-skip, got {result}"
     assert captured == [], f"no build command may be planned, got {captured}"
@@ -3307,9 +3310,14 @@ async def test_a_monorepo_subdirectory_is_built_not_the_clone_root(tmp_path, mon
     ok=True having installed nothing.
     """
     captured: list = []
+    manifests: list = []
 
-    async def _fake_build(build_dir, app_name, log_lines):
+    async def _fake_build(build_dir, app_name, log_lines, *, manifest):
         captured.append(build_dir)
+        # The build's desktop gate decides from the manifest the identity gate
+        # already read, so the caller must hand that over rather than re-reading
+        # an app-writable file.
+        manifests.append(manifest)
         return {"ok": True}
 
     async def _fake_clone(git_url, branch, pkg_dir, log_lines, **kwargs):
@@ -3339,6 +3347,9 @@ async def test_a_monorepo_subdirectory_is_built_not_the_clone_root(tmp_path, mon
     assert (
         captured[0].name == "my-tool" and captured[0].parent.name == "apps"
     ), f"build ran in {captured[0]} — expected the declared subdirectory"
+    assert [m.name for m in manifests] == ["my-tool"], (
+        f"the build must receive the cloned manifest, got {manifests}"
+    )
 
 
 @pytest.mark.asyncio

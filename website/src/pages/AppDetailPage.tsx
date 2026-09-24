@@ -622,6 +622,16 @@ export default function AppDetailPage() {
   const [installDone, setInstallDone] = useState(false)
   const installLogRef = useRef<HTMLPreElement>(null)
   const installAbortRef = useRef<AbortController | null>(null)
+  /**
+   * The message the last install failure reported, for the trust retry to throw.
+   *
+   * A REF, not state: the retry closure reads it immediately after `runInstall()`
+   * returns, and a state update is not visible in that same tick. It is the
+   * string `reportInstallFailure` journaled, so the consent modal's
+   * `ErrorNotice` recovers the endpoint and the install log tail from the same
+   * key it renders (#13446 — the reason was otherwise only in the event log).
+   */
+  const installErrorRef = useRef('')
   const [clientInstall, setClientInstall] = useState<{ shell?: string; postInstall?: string } | null>(null)
   const [copied, setCopied] = useState(false)
   const [serverHostname, setServerHostname] = useState('')
@@ -672,6 +682,7 @@ export default function AppDetailPage() {
       endpoint: '/api/apps/registry/install-stream',
       detail: installLogRef.current?.textContent || undefined,
     })
+    installErrorRef.current = message
     setError(message)
   }, [])
 
@@ -955,6 +966,9 @@ export default function AppDetailPage() {
     setInstallDone(false)
     setShowInstallLog(true)
     clearError()
+    // Drop the previous attempt's reason: a retry that fails for a new cause (or
+    // is aborted, which has none) must never show the first attempt's.
+    installErrorRef.current = ''
     setClientInstall(null)
     installAbortRef.current?.abort()
     const controller = new AbortController()
@@ -1078,7 +1092,13 @@ export default function AppDetailPage() {
         // silent no-op.
         const outcome = await runInstall()
         if (outcome === 'trust-required') throw new Error(APP_EXECUTION_DENIED)
-        if (outcome !== 'done') throw new Error(i18nT('pages.appDetailPage.install_failed'))
+        // The server's own sentence, so the modal can show WHY instead of only
+        // the generic copy. `installErrorRef` holds what `reportInstallFailure`
+        // journaled; an abort reports nothing, so it falls back to the generic
+        // string rather than reusing a stale reason.
+        if (outcome !== 'done') {
+          throw new Error(installErrorRef.current || i18nT('pages.appDetailPage.install_failed'))
+        }
       },
     )
   }
@@ -1318,6 +1338,7 @@ export default function AppDetailPage() {
           app={trust.target}
           pending={trust.pending}
           failed={trust.failed}
+          detail={trust.detail}
           granted={trust.granted}
           onCancel={trust.cancel}
           onConfirm={trust.confirm}

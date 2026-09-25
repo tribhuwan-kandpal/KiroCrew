@@ -10989,6 +10989,8 @@
       "sub_agent_needs_approval_other": "{{count}}টি সাবএজেন্টের অনুমোদন প্রয়োজন",
       "switch_all_sessions": "সব সেশন পাল্টান",
       "switch_all_to_model": "সব সেশনের মডেল পাল্টান…",
+      "bulk_effort_keep": "প্রতিটি সেশনের নিজস্ব প্রচেষ্টা রাখুন",
+      "bulk_effort_needs_reasoning_model": "প্রচেষ্টা শুধু রিজনিং-সক্ষম মডেলেই কাজ করে, তাই প্রতিটি সেশন তার নিজেরটাই রাখে।",
       "switch_failed": "সুইচ করা যায়নি",
       "switch_session_one": "{{count}}টি সেশন পাল্টান",
       "switch_session_other": "{{count}}টি সেশন পাল্টান",

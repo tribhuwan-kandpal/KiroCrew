@@ -10989,6 +10989,8 @@
       "sub_agent_needs_approval_other": "{{count}} Subagenten brauchen Freigabe",
       "switch_all_sessions": "Alle Sitzungen wechseln",
       "switch_all_to_model": "Alle auf Modell umstellen…",
+      "bulk_effort_keep": "Aufwand jeder Sitzung beibehalten",
+      "bulk_effort_needs_reasoning_model": "Nur Modelle mit Reasoning nutzen den Aufwand, daher behält jede Sitzung ihren eigenen.",
       "switch_failed": "Wechseln fehlgeschlagen",
       "switch_session_one": "{{count}} Sitzung wechseln",
       "switch_session_other": "{{count}} Sitzungen wechseln",

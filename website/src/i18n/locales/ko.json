@@ -10829,6 +10829,8 @@
       "sub_agent_needs_approval_other": "서브에이전트 {{count}}개 승인 대기 중",
       "switch_all_sessions": "모든 세션 전환",
       "switch_all_to_model": "모두 다른 모델로 전환…",
+      "bulk_effort_keep": "세션별 강도 유지",
+      "bulk_effort_needs_reasoning_model": "강도는 추론 가능한 모델에서만 사용되므로 각 세션은 자체 설정을 유지합니다.",
       "switch_failed": "전환 실패",
       "switch_session_other": "세션 {{count}}개 전환",
       "switch_to_board_view": "보드 보기로 전환",

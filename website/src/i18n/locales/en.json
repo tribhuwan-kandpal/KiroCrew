@@ -6661,6 +6661,8 @@
       "stop_filtering_by_tag": "Stop filtering by {{name}}",
       "switch_all_sessions": "Switch All Sessions",
       "switch_all_to_model": "Switch all to model…",
+      "bulk_effort_keep": "Keep each session's effort",
+      "bulk_effort_needs_reasoning_model": "Only reasoning-capable models use effort, so each session keeps its own.",
       "tags": "Tags",
       "temporary_no_memory_reads_or_writes": "Temporary — no memory reads or writes",
       "untagged": "+ untagged",

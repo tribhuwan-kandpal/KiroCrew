@@ -23221,6 +23221,150 @@ class TestBulkModelSwitch:
         assert state._slots["a"].model == "claude-fable-5"
         state.sessions.reset.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_effort_applies_with_the_model(self, tmp_path):
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        a = state.get_or_create_slot("a", model="claude-opus-4.6")
+        b = state.get_or_create_slot("b", model="claude-sonnet-4.6")
+        b.reasoning_effort = "low"
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/model",
+                json={"model": "claude-opus-4.8", "reasoning_effort": "high"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["reasoning_effort"] == "high"
+        assert sorted(data["switched"]) == ["a", "b"]
+        assert (a.model, a.reasoning_effort) == ("claude-opus-4.8", "high")
+        assert (b.model, b.reasoning_effort) == ("claude-opus-4.8", "high")
+        assert state.sessions.reset.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_effort_only_difference_switches_without_bumping_model_pick(self, tmp_path):
+        # A slot already on the target model but at another effort is switched:
+        # the reset is what makes the next cold start read the new level. The
+        # model-pick generation stays put, because the model did not change.
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        slot = state.get_or_create_slot("a", model="claude-opus-4.8")
+        slot.reasoning_effort = "low"
+        gen_before = slot._model_pick_gen
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/model",
+                json={"model": "claude-opus-4.8", "reasoning_effort": "max"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["switched"] == ["a"]
+        assert slot.reasoning_effort == "max"
+        assert slot._model_pick_gen == gen_before
+        state.sessions.reset.assert_awaited_once()
+        state.push_slots_update.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_matching_model_and_effort_is_unchanged(self, tmp_path):
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        slot = state.get_or_create_slot("a", model="claude-opus-4.8")
+        slot.reasoning_effort = "high"
+        state.push_slots_update = MagicMock()
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/model",
+                json={"model": "claude-opus-4.8", "reasoning_effort": "high"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["unchanged"] == ["a"]
+        state.sessions.reset.assert_not_awaited()
+        state.push_slots_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_effort_leaves_each_slot_effort_alone(self, tmp_path):
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        slot = state.get_or_create_slot("a", model="claude-opus-4.6")
+        slot.reasoning_effort = "xhigh"
+        on_target = state.get_or_create_slot("b", model="claude-opus-4.8")
+        on_target.reasoning_effort = "low"
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post("/api/chat/slots/model", json={"model": "claude-opus-4.8"})
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["reasoning_effort"] is None
+        assert data["switched"] == ["a"]
+        assert data["unchanged"] == ["b"]
+        assert slot.reasoning_effort == "xhigh"
+        assert on_target.reasoning_effort == "low"
+
+    @pytest.mark.asyncio
+    async def test_empty_effort_clears_the_override(self, tmp_path):
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        slot = state.get_or_create_slot("a", model="claude-opus-4.8")
+        slot.reasoning_effort = "high"
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/model",
+                json={"model": "claude-opus-4.8", "reasoning_effort": ""},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["switched"] == ["a"]
+        assert slot.reasoning_effort == ""
+
+    @pytest.mark.asyncio
+    async def test_effort_left_untouched_when_the_reset_fails(self, tmp_path):
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock(side_effect=RuntimeError("boom"))
+        slot = state.get_or_create_slot("a", model="claude-opus-4.6")
+        slot.reasoning_effort = "low"
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/model",
+                json={"model": "claude-opus-4.8", "reasoning_effort": "high"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["failed"] == ["a"]
+        assert (slot.model, slot.reasoning_effort) == ("claude-opus-4.6", "low")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["extreme", 3, ["high"], {"level": "high"}])
+    async def test_invalid_effort_rejected_no_slot_touched(self, tmp_path, bad):
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        slot = state.get_or_create_slot("a", model="claude-opus-4.6")
+
+        async with TestClient(TestServer(self._app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/model",
+                json={"model": "claude-opus-4.8", "reasoning_effort": bad},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert "reasoning_effort" in data["error"]
+        assert slot.model == "claude-opus-4.6"
+        state.sessions.reset.assert_not_awaited()
+
 
 class TestSlotModelGuard:
     """POST /api/chat/slots/{slot}/model — reject canonical registry keys the

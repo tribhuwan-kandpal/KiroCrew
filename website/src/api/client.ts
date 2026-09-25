@@ -3967,8 +3967,11 @@ export const api = {
   /** Set (number) or clear (null) this slot's auto-compact threshold override. */
   setChatSlotAutocompact: (slot: string, pct: number | null) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/autocompact', { pct }).then(j) as Promise<{ ok?: boolean; pct: number | null; global_pct: number }>,
-  chatSlotsModel: (model: string, skip_running: boolean) =>
-    post('/api/chat/slots/model', { model, skip_running }).then(j) as Promise<{ ok: boolean; model: string; switched: string[]; skipped_running: string[]; unchanged: string[]; failed: string[] }>,
+  /** Switch every session to `model`. `reasoning_effort` (optional) is applied
+   *  alongside it; omit it to leave each session's effort as it is, and pass
+   *  '' to clear every override back to the configured default. */
+  chatSlotsModel: (model: string, skip_running: boolean, reasoning_effort?: string) =>
+    post('/api/chat/slots/model', reasoning_effort === undefined ? { model, skip_running } : { model, skip_running, reasoning_effort }).then(j) as Promise<{ ok: boolean; model: string; reasoning_effort: string | null; switched: string[]; skipped_running: string[]; unchanged: string[]; failed: string[] }>,
   chatSlotReasoningEffort: (slot: string, reasoning_effort: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/reasoning-effort', { reasoning_effort }).then(j) as Promise<{ ok?: boolean; reasoning_effort?: string; deferred?: boolean }>,
   chatSlotWorkspace: (slot: string, workspace: string) =>

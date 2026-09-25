@@ -10989,6 +10989,8 @@
       "sub_agent_needs_approval_other": "{{count}} सब-एजेंट को मंज़ूरी चाहिए",
       "switch_all_sessions": "सभी सत्र बदलें",
       "switch_all_to_model": "सभी को इस मॉडल पर बदलें…",
+      "bulk_effort_keep": "हर सत्र का अपना प्रयास रखो",
+      "bulk_effort_needs_reasoning_model": "प्रयास सिर्फ़ रीज़निंग-सक्षम मॉडल पर लागू होता है, इसलिए हर सत्र अपना प्रयास रखता है।",
       "switch_failed": "स्विच विफल",
       "switch_session_one": "{{count}} सत्र बदलें",
       "switch_session_other": "{{count}} सत्र बदलें",

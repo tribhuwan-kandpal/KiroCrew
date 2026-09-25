@@ -11149,6 +11149,8 @@
       "sub_agent_needs_approval_other": "{{count}} subagentes precisam de aprovação",
       "switch_all_sessions": "Trocar todas as sessões",
       "switch_all_to_model": "Trocar todas para o modelo…",
+      "bulk_effort_keep": "Manter o esforço de cada sessão",
+      "bulk_effort_needs_reasoning_model": "Só modelos com raciocínio usam esforço, então cada sessão mantém o seu.",
       "switch_failed": "Falha ao alternar",
       "switch_session_many": "Trocar {{count}} sessões",
       "switch_session_one": "Trocar {{count}} sessão",

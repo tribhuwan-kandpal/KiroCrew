@@ -8956,9 +8956,16 @@ async def api_chat_slot_autocompact(request: web.Request) -> web.Response:
 async def api_chat_slots_model(request: web.Request) -> web.Response:
     """POST /api/chat/slots/model — set the model for ALL chat slots (bulk).
 
-    Body: {"model": "<name>" | "", "skip_running": bool (default True)}.
+    Body: {"model": "<name>" | "", "skip_running": bool (default True),
+    "reasoning_effort": "" | "<level>" (optional)}.
     "" selects the provider/auto default. Applies the model to every slot
-    whose model differs, resetting each affected slot's session. Mid-turn
+    whose model differs, resetting each affected slot's session. When
+    ``reasoning_effort`` is present, it is applied the same way: a slot whose
+    effort differs is switched (and reset) even if its model already matches,
+    and "" clears the slot's override so it runs at the configured default.
+    Absent or null leaves every slot's effort as it is. The level is recorded
+    on the slot whether or not the target model can use it, exactly as the
+    single-slot effort pick records it on a non-capable model. Mid-turn
     policy deliberately differs from ``api_chat_slot_model``: the single-slot
     handler prefers a live in-place switch and answers 409 for a slot
     mid-turn, while this bulk endpoint always resets and skips mid-turn slots
@@ -8980,6 +8987,18 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
     skip_running = body.get("skip_running", True)
     if not isinstance(skip_running, bool):
         return web.json_response({"error": "skip_running must be a boolean"}, status=400)
+    # None means "leave each slot's effort alone"; a string is a level to apply.
+    effort = body.get("reasoning_effort")
+    if effort is not None:
+        valid_efforts = get_reasoning_effort_values()
+        if not isinstance(effort, str) or effort not in valid_efforts:
+            return web.json_response(
+                {
+                    "error": "reasoning_effort must be one of: "
+                    + ", ".join(sorted(valid_efforts - {""}))
+                },
+                status=400,
+            )
     # Deny-by-default (security-controls): the auth middleware always sets
     # request["app"] on every authenticated path (empty string for dashboard
     # users, app name for app tokens). An ABSENT key means the middleware did
@@ -9058,9 +9077,12 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
                 # does not get to switch the model a channel thread runs on.
                 # Skipped silently, like every other slot the app does not own.
                 continue
-            if slot.model == model_name:
-                # The MODEL is unchanged; the routing choice may not be. A slot
-                # already on this model but routed per turn is a slot whose turns
+            model_changes = slot.model != model_name
+            effort_changes = effort is not None and slot.reasoning_effort != effort
+            if not model_changes and not effort_changes:
+                # The model and any requested effort are unchanged; the routing
+                # choice may not be. A slot already on this model but routed per
+                # turn is a slot whose turns
                 # would still be moved off it, so the flag is cleared here as well
                 # -- otherwise the one case where the bulk switch reports "nothing
                 # to do" is the one case where it silently did nothing at all.
@@ -9163,9 +9185,18 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
                 # after the reset); report it as skipped so the caller retries.
                 skipped_running.append(name)
                 continue
-            slot.model = model_name
-            # Explicit pick (bulk): same generation bump as the single-slot pick.
-            slot._model_pick_gen += 1
+            if model_changes:
+                slot.model = model_name
+                # Explicit pick (bulk): same generation bump as the single-slot
+                # pick. Only a model change bumps it: the counter tracks model
+                # picks, and an effort-only switch leaves the model where it was.
+                slot._model_pick_gen += 1
+            if effort_changes and effort is not None:
+                # Committed with the model, after the reset: the session that
+                # held the old effort is gone, and the next cold start reads
+                # this value as its override (ConfigLoader's
+                # ``reasoning_effort_override or default``).
+                slot.reasoning_effort = effort
             # And the same clearing of the routing choice. This surface takes no
             # "Auto (Jev)" target -- it switches many sessions to one model, which
             # is the opposite of a per-turn tier -- but it is an explicit pick, so
@@ -9177,8 +9208,10 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
 
     if switched:
         logger.info(
-            "Bulk model switch to %r: %d switched, %d skipped-running, %d unchanged, %d failed",
+            "Bulk model switch to %r (effort %r): %d switched, %d skipped-running, "
+            "%d unchanged, %d failed",
             model_name or "auto",
+            "unchanged" if effort is None else (effort or "default"),
             len(switched),
             len(skipped_running),
             len(unchanged),
@@ -9194,6 +9227,7 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
         {
             "ok": True,
             "model": model_name,
+            "reasoning_effort": effort,
             "switched": switched,
             "skipped_running": skipped_running,
             "unchanged": unchanged,

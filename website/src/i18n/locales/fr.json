@@ -11149,6 +11149,8 @@
       "sub_agent_needs_approval_other": "{{count}} sous-agents attendent une approbation",
       "switch_all_sessions": "Basculer toutes les sessions",
       "switch_all_to_model": "Basculer toutes vers le modèle…",
+      "bulk_effort_keep": "Conserver l’effort de chaque session",
+      "bulk_effort_needs_reasoning_model": "Seuls les modèles capables de raisonnement utilisent l’effort : chaque session conserve le sien.",
       "switch_failed": "Échec du changement",
       "switch_session_many": "Basculer {{count}} sessions",
       "switch_session_one": "Basculer {{count}} session",

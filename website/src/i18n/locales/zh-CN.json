@@ -10829,6 +10829,8 @@
       "sub_agent_needs_approval_other": "{{count}} 个子代理待审批",
       "switch_all_sessions": "切换所有会话",
       "switch_all_to_model": "全部切换到模型…",
+      "bulk_effort_keep": "保留各会话的强度",
+      "bulk_effort_needs_reasoning_model": "只有具备推理能力的模型才使用强度，因此每个会话保留各自的设置。",
       "switch_failed": "切换失败",
       "switch_session_other": "切换 {{count}} 个会话",
       "switch_to_board_view": "切换到看板视图",

@@ -11309,6 +11309,8 @@
       "sub_agent_needs_approval_other": "{{count}} субагента ждёт одобрения",
       "switch_all_sessions": "Переключить все сессии",
       "switch_all_to_model": "Переключить все на модель…",
+      "bulk_effort_keep": "Сохранить глубину каждой сессии",
+      "bulk_effort_needs_reasoning_model": "Глубину используют только модели с рассуждением, поэтому каждая сессия сохраняет свою.",
       "switch_failed": "Не удалось переключить",
       "switch_session_few": "Переключить {{count}} сессии",
       "switch_session_many": "Переключить {{count}} сессий",

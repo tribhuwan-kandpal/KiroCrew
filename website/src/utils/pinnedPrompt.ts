@@ -236,23 +236,26 @@ export function pinPushTravel(bannerH: number): number {
  * Height the pinned card should be on this frame — the progressive fold.
  *
  * The card's top is fixed at `foldY + ROW_PAD_Y`. Its bottom should sit on the
- * pinned row's bottom edge, because that is where the reply begins: match them and
- * there is no gap between the card and the reply, at any prompt height. So the
- * height wanted is simply the distance from the card's top to the row's bottom.
+ * pinned BUBBLE's bottom edge: the card is a stand-in for the bubble alone, and
+ * what follows the bubble in its row — the message's action strip, then the
+ * reply — is left in place under the hidden row (see `[data-pinned-standin]` in
+ * index.css), so matching the bubble's edge is what keeps the card from ever
+ * covering those controls while leaving no gap of its own. The height wanted is
+ * therefore the distance from the card's top to the bubble's bottom.
  *
  * Bounded at both ends, and each bound is load-bearing:
  *   - never above `bubbleH`, so a freshly pinned prompt is a pixel-exact stand-in
  *     for the bubble rather than a taller box that pushes the reply down;
  *   - never below `restingH`, because the card cannot show less than its clamp. Past
- *     that point the row's slot is smaller than the card and the reply slides under
- *     it, which is the same one-line overlap the band already has at rest.
+ *     that point the bubble's slot is smaller than the card and the strip and reply
+ *     slide under it, which is the same one-line overlap the band already has at rest.
  *
- * @param rowBottomFromFold pinned row's bottom edge, relative to the fold line
- * @param restingH          settled height of the clamped card
- * @param bubbleH           height of the bubble the card stands in for
+ * @param bubbleBottomFromFold pinned bubble's bottom edge, relative to the fold line
+ * @param restingH             settled height of the clamped card
+ * @param bubbleH              height of the bubble the card stands in for
  */
 export function computeLiveCardH(
-  rowBottomFromFold: number,
+  bubbleBottomFromFold: number,
   restingH: number,
   bubbleH: number,
 ): number {
@@ -260,7 +263,7 @@ export function computeLiveCardH(
   // card is already its resting size and the max() below would otherwise stretch
   // it past the bubble it is copying.
   const ceiling = Math.max(restingH, bubbleH)
-  const wanted = rowBottomFromFold - ROW_PAD_Y
+  const wanted = bubbleBottomFromFold - ROW_PAD_Y
   return Math.min(ceiling, Math.max(restingH, wanted))
 }
 

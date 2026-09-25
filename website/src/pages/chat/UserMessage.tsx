@@ -405,8 +405,13 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
       {/* Where the pointer cannot hover the footer is always visible and its
           descendant overrides grow every action to a 40px touch target (20px
           icon + 10px padding); hover-capable pointers keep the reveal-on-hover
-          behavior and the compact 14px icons untouched. */}
-      <div className={`flex items-center gap-y-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${ICON_ACTION_ROW_CLS}`}>
+          behavior and the compact 14px icons untouched.
+          `data-message-actions` is the hook index.css uses while this row is
+          the pinned banner's stand-in (`[data-pinned-standin]`): the row is
+          `visibility: hidden` and the card copies only the bubble, so the strip
+          is re-shown in place — visible outright, because the card lives in an
+          overlay outside this row and its hover can never be `group-hover/msg`. */}
+      <div data-message-actions="" className={`flex items-center gap-y-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${ICON_ACTION_ROW_CLS}`}>
         {onReplyInThread && (
           <button
             onClick={onReplyInThread}
@@ -467,6 +472,13 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
         {canEdit && onEditResend && (
           <button
             onClick={startEdit}
+            // `data-message-edit`: index.css drops this control while the row is
+            // the pinned banner's stand-in. Editing replaces the bubble with the
+            // textarea + Cancel/Send tree above, which is not part of the strip
+            // and so would open inside the row's `visibility: hidden` — an editor
+            // no one can see, focus or leave. Edit is offered again once the row
+            // scrolls back below the fold.
+            data-message-edit=""
             className="text-muted hover:text-text p-0.5 rounded transition-colors"
             title={i18nT('pages.chat.userMessage.edit_resend')}
             aria-label={i18nT('pages.chat.userMessage.edit_resend')}

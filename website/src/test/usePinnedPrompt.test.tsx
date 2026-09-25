@@ -349,6 +349,50 @@ describe('usePinnedPrompt push geometry is resting-height-derived', () => {
 })
 
 /**
+ * The fold stands in for the BUBBLE, not the row. UserMessage draws an action
+ * strip (copy / copy link / pin / timestamp) under its bubble, and the hidden row
+ * re-shows that strip in place (index.css `[data-pinned-standin]`), so the card
+ * has to fold down to the bubble's bottom edge: a card reaching the ROW's bottom
+ * would sit exactly over the controls the hand-off leaves visible.
+ */
+describe('usePinnedPrompt folds the card to the bubble, leaving the action strip clear', () => {
+  it('reports a live height whose bottom is the bubble bottom, not the row bottom', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    // The pinned row (index 2) is a tall prompt whose top has crossed the fold
+    // (fold at 100): row 60..460, bubble 64..430, then a 4px gap and a 26px strip.
+    setRect(g.rows[2], 60, 400)
+    const bubble = document.createElement('div')
+    bubble.className = 'message-bubble user-bubble'
+    g.rows[2].append(bubble)
+    setRect(bubble, 64, 366)
+    // Push the incoming prompt far down so the card is not being pushed out.
+    setRect(g.rows[3], 460, 40)
+    setRect(g.rows[4], 900, 40)
+    wire(h, g)
+    // Card top is fold + ROW_PAD_Y = 104; bubble bottom is 430 → 326px tall.
+    // The row's bottom (460) would have given 356px and buried the strip.
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, liveH: 326 })
+  })
+
+  it('measures a steer bubble too, through the shared message-bubble hook', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    setRect(g.rows[2], 60, 400)
+    // A steer's bubble carries `message-bubble` but not `user-bubble`.
+    const bubble = document.createElement('div')
+    bubble.className = 'message-bubble'
+    g.rows[2].append(bubble)
+    setRect(bubble, 88, 300)
+    setRect(g.rows[3], 460, 40)
+    setRect(g.rows[4], 900, 40)
+    wire(h, g)
+    // 388 − 104 = 284, capped by the bubble's own 300px height.
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, liveH: 284 })
+  })
+})
+
+/**
  * Reduced motion must remove the eased TRAVEL of the jump, not its convergence.
  * The landing is re-derived every frame because rows mount, images load and the
  * banner swaps DURING the jump — and the swap is caused by our own scroll write,

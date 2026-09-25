@@ -371,8 +371,10 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
     // A plain block wrapper: it takes the row's own box (padding included), so
     // its rect IS the row's rect for the geometry that reads it, and it adds no
     // class of its own so the theming contract on the inner row is untouched.
+    // `data-pinned-standin` marks the hidden row for index.css, which re-shows
+    // the message's action strip beneath the card standing in for its bubble.
     return (
-      <div key={'row-' + i} data-display-index={i} style={hidden ? { visibility: 'hidden' } : undefined}>
+      <div key={'row-' + i} data-display-index={i} data-pinned-standin={hidden ? '' : undefined} style={hidden ? { visibility: 'hidden' } : undefined}>
         {node}
       </div>
     )

@@ -281,12 +281,15 @@ const VirtualTranscript = forwardRef<VirtualTranscriptHandle, VirtualTranscriptP
           // A plain block wrapper: it takes the row's own box (padding
           // included), so its rect IS the row's rect for the geometry that
           // reads `data-display-index`, and it adds no class of its own so the
-          // theming contract on the inner row is untouched.
+          // theming contract on the inner row is untouched. `data-pinned-standin`
+          // marks the hidden row for index.css, which re-shows the message's
+          // action strip beneath the card standing in for its bubble.
           return (
             <div
               key={vi.key}
               ref={virt.measureRef(vi.index)}
               data-display-index={vi.index}
+              data-pinned-standin={hidden ? '' : undefined}
               style={hidden ? { visibility: 'hidden' } : undefined}
             >
               {renderRow(vi.data, vi.index)}

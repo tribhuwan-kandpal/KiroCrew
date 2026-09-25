@@ -35,7 +35,7 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -947,6 +947,42 @@ def _recorded_unit_order(owner: str, repo: str, crew_id: str, root: Path | None)
     """
     try:
         path = _unit_order_path(owner, repo, crew_id, root)
+    except ValueError:
+        return ()
+    return _read_unit_order_held(path)
+
+
+def _read_unit_order_held(path: Path) -> tuple[str, ...]:
+    """:func:`_recorded_unit_order_at` with *path*'s parent chain held while it reads.
+
+    The read names the whole path, so where the write cannot go through a descriptor
+    the read carries the same exposure as the write: resolving a junction aimed at a
+    UNC share is itself an outbound authentication as this process, to a host whoever
+    planted the link chose. The chain is held first and the name resolved under it,
+    by :func:`_hold_chain_for_by_name_use` with ``create=False`` -- an absent component
+    means no order file can exist, and a read must not create the store it reads.
+
+    An absent or unholdable component answers ``()``, as an unreadable file does: the
+    caller falls back to header order.
+    """
+    try:
+        held = _hold_chain_for_by_name_use(path.parent, create=False)
+    except OSError:
+        return ()
+    try:
+        return _recorded_unit_order_at(path)
+    finally:
+        _release_held(held)
+
+
+def _recorded_unit_order_at(path: Path) -> tuple[str, ...]:
+    """The units recorded in *path*, oldest first; ``()`` when it holds none.
+
+    Takes the path its caller already derived, so a caller holding the parent chain
+    reads the object it holds instead of resolving the same name a second time.
+    Whatever protection that name needs belongs to the caller: this is the parse.
+    """
+    try:
         if not path.is_file():
             return ()
         fd = platform_compat.open_file_no_reparse(path)
@@ -976,16 +1012,29 @@ def _record_unit_order(
     end, not appended twice, so the fold never folds a unit twice. The file is
     compacted to the bound once it outgrows it. Best-effort: a crew whose order
     cannot be written folds its units in header order instead.
+
+    The path is derived without touching the filesystem, and every component of its
+    parent is then held (:func:`_hold_chain_for_by_name_use`) for as long as the read
+    AND the write take. The read names the whole path too, so a chain held only for
+    the write would leave that resolution -- and, where junctions exist, an outbound
+    authentication through one -- outside every screen. The write walks the chain again
+    under this hold; that walk cannot reach other objects, because nothing a hold
+    covers can be renamed or deleted while it lives, so it re-proves the chain rather
+    than opening a second window onto it.
     """
     if not session_id:
         return
     try:
         path = _unit_order_path(owner, repo, crew_id, root)
-        known = _recorded_unit_order(owner, repo, crew_id, root)
-        if known and known[-1] == session_id:
-            return
-        ordered = tuple(u for u in known if u != session_id) + (session_id,)
-        _write_unit_order(path, ordered[-_MAX_ORDERED_UNITS:])
+        held = _hold_chain_for_by_name_use(path.parent, create=True)
+        try:
+            known = _recorded_unit_order_at(path)
+            if known and known[-1] == session_id:
+                return
+            ordered = tuple(u for u in known if u != session_id) + (session_id,)
+            _write_unit_order(path, ordered[-_MAX_ORDERED_UNITS:])
+        finally:
+            _release_held(held)
     except (OSError, ValueError):
         logger.warning("crew ledger: could not record crew %s's unit order", crew_id, exc_info=True)
 
@@ -1032,11 +1081,7 @@ def _write_unit_order(path: Path, lines: tuple[str, ...]) -> None:
             )
         atomic_write(path, content, fsync=True, newline="")
     finally:
-        for fd in reversed(held):
-            try:
-                os.close(fd)
-            except OSError:
-                logger.debug("crew ledger: a held unit-order component would not close")
+        _release_held(held)
 
 
 def _hold_chain_no_follow(directory: Path) -> list[int]:
@@ -1077,18 +1122,54 @@ def _hold_chain_no_follow(directory: Path) -> list[int]:
     path -- the first open would then be the outbound authentication this exists to
     prevent. :func:`_unit_order_path` builds from :func:`data_home`, which is local.
     """
+    return _hold_walk(directory, _pin_or_create)
+
+
+def _hold_walk(directory: Path, pin: Callable[[Path], int]) -> list[int]:
+    """Hold every component of *directory* with *pin*, root-first, outermost first out.
+
+    Root-first is what makes each open mean something: a component is opened only once
+    every component above it is held and proved. A failure part-way releases what it
+    took, because a half-held chain protects nothing and its descriptors would leak.
+    """
     held: list[int] = []
     try:
         for component in [*reversed(directory.parents), directory]:
-            held.append(_pin_or_create(component))
+            held.append(pin(component))
     except BaseException:
-        for fd in reversed(held):
-            try:
-                os.close(fd)
-            except OSError:
-                logger.debug("crew ledger: a held unit-order component would not close")
+        _release_held(held)
         raise
     return held
+
+
+def _hold_chain_for_by_name_use(directory: Path, *, create: bool) -> list[int]:
+    """The hold a BY-NAME read or write of the unit order needs under *directory*.
+
+    ``[]`` where :func:`atomic_write.pinned_parent_replace_supported` answers yes: the
+    write there goes through a pinned descriptor and the hold would buy nothing it does
+    not already have, while changing what that platform does -- POSIX cannot block a
+    rename, and creating or refusing a component on the walk is behaviour of its own.
+
+    Elsewhere the chain is walked and held, because that is the platform with junctions
+    and a by-name resolution through one is an outbound authentication. With *create* an
+    absent component is created in place (:func:`_pin_or_create`), which the write needs;
+    without it an absent component raises ``FileNotFoundError``, because a read has
+    nothing to find there and must not create the store it reads.
+    """
+    if atomic_write_module.pinned_parent_replace_supported():
+        return []
+    if create:
+        return _hold_chain_no_follow(directory)
+    return _hold_walk(directory, platform_compat.pin_directory)
+
+
+def _release_held(held: list[int]) -> None:
+    """Close a held chain, innermost first, and keep going when one will not close."""
+    for fd in reversed(held):
+        try:
+            os.close(fd)
+        except OSError:
+            logger.debug("crew ledger: a held unit-order component would not close")
 
 
 def _pin_or_create(component: Path) -> int:

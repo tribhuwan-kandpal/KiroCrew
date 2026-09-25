@@ -3838,3 +3838,195 @@ def test_the_pinned_parent_branch_is_unchanged_on_a_posix_host(tmp_path):
         cs._hold_chain_no_follow = real_walk
     assert walked == [], "the pinned-parent branch must not take the by-name walk"
     assert order.read_text(encoding="utf-8").split() == [sid]
+
+
+def test_the_unit_order_record_holds_the_chain_before_it_reads_the_name(tmp_path, monkeypatch):
+    """Recording holds every component of the parent BEFORE the read resolves the name,
+    and is still holding them when the write runs.
+
+    The read names the whole path, exactly as the write does, so a hold that began only
+    at the write would leave that resolution unscreened -- and on the platform with
+    junctions, resolving one aimed at a UNC share is itself an outbound authentication.
+    Asserted from inside the read, because a hold taken and released around the walk
+    would satisfy an after-the-fact check. The write walks the chain a second time under
+    the hold, which is why ``hold`` appears again between the read and the write."""
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    order = cs._unit_order_path(OWNER, REPO, cid, tmp_path)
+    _fallback_only(monkeypatch)
+    order.parent.mkdir(parents=True, exist_ok=True)
+    order.write_text(f"{_unit(cid)}\n", encoding="utf-8")
+
+    parent = order.parent
+    components = [*reversed(parent.parents), parent]
+    trace: list[str] = []
+    handed: list[int] = []
+
+    real_walk = cs._hold_chain_no_follow
+
+    def walk(directory):
+        fds = real_walk(directory)
+        handed.extend(fds)
+        trace.append("hold")
+        return fds
+
+    real_read = cs._recorded_unit_order_at
+
+    def read(path):
+        trace.append("read")
+        assert len(handed) == len(components), "the whole chain is held before the read"
+        for component, fd in zip(components, handed, strict=True):
+            try:
+                info = os.fstat(fd)
+            except OSError as exc:  # pragma: no cover - the mutation's path
+                raise AssertionError(f"{component} was not held during the read") from exc
+            on_disk = os.stat(component)
+            assert (info.st_dev, info.st_ino) == (
+                on_disk.st_dev,
+                on_disk.st_ino,
+            ), f"the descriptor held for {component} is not that component"
+        return real_read(path)
+
+    real_write = cs.atomic_write
+
+    def write(path, content, **kw):
+        trace.append("write")
+        for fd in handed:
+            os.fstat(fd)
+        return real_write(path, content, **kw)
+
+    monkeypatch.setattr(cs, "_hold_chain_no_follow", walk)
+    monkeypatch.setattr(cs, "_recorded_unit_order_at", read)
+    monkeypatch.setattr(cs, "atomic_write", write)
+    cs._record_unit_order(OWNER, REPO, cid, sid, tmp_path)
+
+    assert trace[0] == "hold", "the hold is taken first"
+    assert trace[1] == "read", "the read runs under it"
+    assert trace[-1] == "write", "the write runs last, still under it"
+    assert order.read_text(encoding="utf-8").split()[-1] == sid, "the record landed"
+    for fd in handed:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+def test_a_record_that_changes_nothing_still_releases_the_chain(tmp_path, monkeypatch):
+    """A unit already newest is a bare read -- and the hold that read ran under is
+    released, not leaked, on that early return.
+
+    The common case by far: a crew recording repeatedly into the unit it is already in.
+    A descriptor leaked once per cycle would exhaust the process, and on the platform
+    the hold is for it would also keep a directory unrenamable for the gateway's life."""
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    order = cs._unit_order_path(OWNER, REPO, cid, tmp_path)
+    _fallback_only(monkeypatch)
+    order.parent.mkdir(parents=True, exist_ok=True)
+    order.write_text(f"{sid}\n", encoding="utf-8")
+
+    handed: list[int] = []
+    real_walk = cs._hold_chain_no_follow
+
+    def walk(directory):
+        fds = real_walk(directory)
+        handed.extend(fds)
+        return fds
+
+    wrote: list[str] = []
+    real_write = cs.atomic_write
+
+    def write(path, content, **kw):
+        wrote.append(os.fspath(path))
+        return real_write(path, content, **kw)
+
+    monkeypatch.setattr(cs, "_hold_chain_no_follow", walk)
+    monkeypatch.setattr(cs, "atomic_write", write)
+    cs._record_unit_order(OWNER, REPO, cid, sid, tmp_path)
+
+    assert wrote == [], "a unit already newest is not written again"
+    assert handed, "the read still ran under a hold"
+    for fd in handed:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+def test_the_reads_walk_creates_nothing_under_the_directory_it_holds(tmp_path, monkeypatch):
+    """The read asks for a walk that holds what is there and creates nothing; the write
+    asks for the one that creates a missing component in place.
+
+    Both halves are asserted here because the difference is the whole point of the flag:
+    a read runs on a crew's every cycle, so a read whose walk created its own chain
+    would write state on every read of a store that holds none, and the fold's answer
+    for a crew that recorded nothing is header order -- which ``()`` is."""
+    _fallback_only(monkeypatch)
+    nowhere = tmp_path / "nowhere"
+    assert not nowhere.exists(), "the directory starts absent"
+
+    with pytest.raises(FileNotFoundError):
+        cs._hold_chain_for_by_name_use(nowhere, create=False)
+    assert not nowhere.exists(), "the read's walk created nothing"
+
+    assert cs._read_unit_order_held(nowhere / f"c_00000000{cs._UNIT_ORDER_SUFFIX}") == ()
+    assert not nowhere.exists(), "and the read answered without creating it"
+
+    held = cs._hold_chain_for_by_name_use(nowhere, create=True)
+    try:
+        assert nowhere.is_dir(), "the write's walk creates it in place instead"
+    finally:
+        cs._release_held(held)
+
+
+def test_a_component_that_cannot_be_held_stops_the_read_before_the_name(tmp_path, monkeypatch):
+    """A component that refuses to open without following a link stops the read, and
+    the name is never resolved through it.
+
+    A reparse point at a component is what that refusal stands for: on the platform
+    with junctions the open is the screen, so a read that fell back to resolving the
+    name anyway would perform the traversal the refusal exists to prevent. The answer
+    is ``()`` -- header order -- not an exception into a crew's read path."""
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    order = cs._unit_order_path(OWNER, REPO, cid, tmp_path)
+    order.parent.mkdir(parents=True, exist_ok=True)
+    order.write_text(f"{sid}\n", encoding="utf-8")
+    _fallback_only(monkeypatch)
+
+    real_pin = cs.platform_compat.pin_directory
+
+    def refuse_that_component(component):
+        if os.fspath(component) == os.fspath(order.parent):
+            raise OSError("a reparse point sits at this component")
+        return real_pin(component)
+
+    resolved: list[str] = []
+    real_read = cs._recorded_unit_order_at
+
+    def read(path):
+        resolved.append(os.fspath(path))
+        return real_read(path)
+
+    monkeypatch.setattr(cs.platform_compat, "pin_directory", refuse_that_component)
+    monkeypatch.setattr(cs, "_recorded_unit_order_at", read)
+
+    assert cs._recorded_unit_order(OWNER, REPO, cid, tmp_path) == (), "the read refuses"
+    assert resolved == [], "the name was never resolved through the refused component"
+
+
+def test_the_posix_read_path_takes_no_hold(tmp_path):
+    """Where a descriptor-relative rename exists, the read takes no chain hold either.
+
+    The hold's value is the platform's: a handle that blocks renaming and deleting, and
+    an open that refuses a reparse point. POSIX has neither, writes through a pinned
+    descriptor instead, and a walk here would create and refuse components that POSIX
+    today resolves -- so this is the pin that says POSIX behaviour did not move."""
+    from kiro_crew import atomic_write as atomic_write_module
+
+    if not atomic_write_module.pinned_parent_replace_supported():
+        pytest.skip("this host has no descriptor-relative rename; the fallback is the only path")
+
+    crew, sid = _live_crew(tmp_path)
+    cid = crew["id"]
+    cs._record_unit_order(OWNER, REPO, cid, sid, tmp_path)
+
+    assert cs._hold_chain_for_by_name_use(tmp_path, create=True) == [], "no hold is taken"
+    assert cs._hold_chain_for_by_name_use(tmp_path, create=False) == [], "and none to read"
+    assert cs._recorded_unit_order(OWNER, REPO, cid, tmp_path) == (sid,), "the read still works"

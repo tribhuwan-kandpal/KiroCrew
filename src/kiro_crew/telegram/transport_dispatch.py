@@ -68,6 +68,8 @@ from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     delivery_is_muted,
     driver_turn_landed,
+    open_turn_crew_log,
+    predecessor_sid,
     rearm_reinjection,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
@@ -1143,6 +1145,10 @@ class TelegramDispatcher:
             if not muted:
                 await renderer.on_turn_start()
             _memory_store = await session_store_for_turn(self.ctx_builder, session_key)
+            # The crew log this conversation was writing, read BEFORE
+            # ``get_or_create`` maps the successor's id over it -- the same source
+            # and moment as the dashboard runner's latch (``predecessor_sid``).
+            previous_sid = predecessor_sid(self.sessions, session_key)
             provider, is_new, resumed = await self.sessions.get_or_create(
                 session_key,
                 agent=agent,
@@ -1190,6 +1196,21 @@ class TelegramDispatcher:
                 if setter is not None and channel_namespace_of(session_key) != DM_SCOPE_UNIFIED:
                     setter(session_key, self._origin_mirror_link(route, chat_id))
                 self._bind_origin_mirror(session_key, route, chat_id)
+                # The session's crew log, opened before the turn the way the
+                # dashboard runner opens one: the work ledger appends every write
+                # to the acting session's log and rolls back one it cannot record,
+                # so a DM admitted as a conductor needs its log to exist before
+                # its first ledger call. Inside the same own-session branch as the
+                # origin record: a resumed dashboard session's opener is the
+                # dashboard's, which alone holds its lineage.
+                open_turn_crew_log(
+                    provider,
+                    session_key=session_key,
+                    agent=agent,
+                    resumed=resumed,
+                    ctx_builder=self.ctx_builder,
+                    previous_sid=previous_sid,
+                )
             # ── Attachment ingestion (mirrors Discord) ──
             if msg.attachments:
                 attachment_result = await process_telegram_attachments(self.client, msg.attachments)

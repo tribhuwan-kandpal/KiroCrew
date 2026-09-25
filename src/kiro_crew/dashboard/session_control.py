@@ -86,7 +86,12 @@ from kiro_crew.execution_context import (
 )
 from kiro_crew.history import metadata_now_iso, transcript_stem
 from kiro_crew.memory_stores import named_store_or_empty
-from kiro_crew.messaging.link import CHAT_TYPE_DIRECT, ChannelLink, parse_session_key
+from kiro_crew.messaging.link import (
+    CHAT_TYPE_DIRECT,
+    ChannelLink,
+    _is_unrouted_slack_placeholder,
+    parse_session_key,
+)
 from kiro_crew.messaging.transport import DM_TARGET_PREFIX, sole_direct_target
 from kiro_crew.security import redact, redact_and_truncate
 from kiro_crew.sel import sel
@@ -148,7 +153,7 @@ CRON_LINK_PREFIX = "cron:"
 APP_CRON_OWNER_PREFIX = "app:"
 
 # The channels whose 1:1 DM session can be recognised as the configured owner's
-# own conversation by :func:`audience_is_owner`. Membership asserts two facts
+# own conversation by :func:`owner_dm_refusal`. Membership asserts two facts
 # that were VERIFIED against the transport, and a surface is added only by
 # verifying both again for it:
 #
@@ -310,14 +315,14 @@ def _caller_is_ownership_fenced(state: "DashboardState", caller_key: str) -> boo
 
     * a crew member's DM slot, which bypasses the config switch;
     * a cron job's own slot, which bypasses the unattended refusal;
-    * a channel-born slot admitted as the owner's own DM (:func:`audience_is_owner`),
-      which bypasses the channel-link refusals. Every non-cron link is fenced, not
-      only the admitted ones: the only linked caller that gets past those refusals
-      is an owner DM, and fencing on the link rather than on the admission keeps
-      the fence readable without the transport roster or the session store. What
-      it buys is the bound on a wrong audience inference: the DM reaches the
-      workers it dispatched and never the person's own tabs, the same reach a
-      crew member has;
+    * a channel-born slot admitted as the owner's own DM (:func:`owner_dm_refusal`
+      answering ``""``), which bypasses the channel-link refusals. Every non-cron
+      link is fenced, not only the admitted ones: the only linked caller that gets
+      past those refusals is an owner DM, and fencing on the link rather than on
+      the admission keeps the fence readable without the transport roster or the
+      session store. What it buys is the bound on a wrong audience inference: the
+      DM reaches the workers it dispatched and never the person's own tabs, the
+      same reach a crew member has;
     * **anything any of them created**, which is the part a key prefix cannot
       see. A created child is minted with a plain ``chat-`` key and INHERITS the
       creator's agent, so a fenced caller running a session-control agent would
@@ -780,22 +785,41 @@ def _has_channel_mirror(
     return on_probe_failure if probed is None else bool(probed)
 
 
-def audience_is_owner(state: "DashboardState", slot: "_ChatSlot") -> bool:
-    """Whether every surface *slot*'s turns reach is the configured owner's own DM.
+ORIGIN_NOT_ON_RECORD = (
+    "this conversation's origin is not on record -- the channel dispatcher records "
+    "it on each inbound message and it is not kept across a gateway restart, so "
+    "send a message from the DM and retry"
+)
+"""The refusal an owner DM meets between a gateway restart and its next inbound turn.
+
+The origin (``SessionManager.get_origin_link``) is held in memory only, while the
+slot and its mirror are persisted and re-surfaced at boot -- so a monitor-loop cycle
+or a dashboard-tab turn that runs before the owner's next channel message finds
+every other clause satisfied and this one not. Naming it keeps a caller from
+hunting for a link it cannot clear; the exemption itself stays withheld, because a
+mirror without the recorded origin cannot be told from a retarget.
+"""
+
+
+def owner_dm_refusal(state: "DashboardState", slot: "_ChatSlot") -> str:
+    """Why *slot* is not the configured owner's own DM -- ``""`` when it is.
 
     The ONE predicate the three channel-containment gates consult -- the creator
     gate and the target gate here, the ledger gate in ``handlers/work_ledger.py``
-    -- so they cannot drift: a gate keying on the live link, one on the key prefix
-    and one on the mirror store would each admit and refuse different slots, and
-    a key prefix can never be cleared while a link can. That containment exists
-    because a channel session acts on words from a thread other people are in,
-    and what it reads lands in front of them. For a 1:1 DM whose only human is
-    the operator, the "audience" being protected is the operator themself, and
-    refusing it makes every Discord and Telegram conversation a session that can
-    dispatch nothing.
+    (through :func:`session_owner_dm_refusal`) -- so they cannot drift: a gate
+    keying on the live link, one on the key prefix and one on the mirror store
+    would each admit and refuse different slots, and a key prefix can never be
+    cleared while a link can. That containment exists because a channel session
+    acts on words from a thread other people are in, and what it reads lands in
+    front of them. For a 1:1 DM whose only human is the operator, the "audience"
+    being protected is the operator themself, and refusing it makes every Discord
+    and Telegram conversation a session that can dispatch nothing.
 
-    Every clause is a positive fact, and any that cannot be established answers
-    ``False``. In order:
+    Every clause is a positive fact, and the first one that cannot be established
+    is the answer, so a gate that refuses can say which fact was missing without a
+    second walk that could disagree with the first. Every reason is generic -- a
+    surface name at most, never an id -- because it is rendered into the refusal
+    the caller reads in its own channel. In order:
 
     * *slot* is channel-born: its ``linked_session_key`` is a channel key (a cron
       tab's link is not, see ``CRON_LINK_PREFIX``). A dashboard-born slot is not
@@ -827,44 +851,32 @@ def audience_is_owner(state: "DashboardState", slot: "_ChatSlot") -> bool:
       store or a mirror that names anywhere else refuses. Compared as a whole
       :class:`ChannelLink` because the DM channel id is not the peer id on every
       surface (Discord's is the id ``create_dm_channel`` returned), so no
-      derivation from the key could stand in for the recorded truth.
+      derivation from the key could stand in for the recorded truth. One row
+      reads as NO mirror: the threadless Slack placeholder
+      (:func:`~kiro_crew.messaging.link._is_unrouted_slack_placeholder`) that
+      ``SessionMap.get_mirror_link`` synthesizes from the namespaced bucket the
+      dispatcher's first turn stamped into the legacy ``slack_channel_id`` field.
+      It is what every unlinked channel session reads back -- ``clear_mirror_link``
+      pops only the ``mirror`` row -- and it is bookkeeping nobody can deliver
+      through (an empty ``thread_ts`` never enters Slack's thread index), so it
+      names no audience; ``bind_origin_mirror`` skips the same row for the same
+      reason. Without this, ``!unlink`` or the dashboard's mirror-unlink would
+      leave an owner DM refused for a mirror that reaches nobody. The converse
+      row is a second audience the mirror read CANNOT see: ``get_mirror_link``
+      returns the explicit ``mirror`` row whenever one exists and never looks at
+      the Slack fields beside it, while the dashboard's slack-link writes its
+      thread onto the slot's effective key -- this session, for a channel-born
+      slot (``DashboardState.link_slack``) -- and the turn path posts every
+      dashboard-driven reply into that thread straight off ``get_slack_link``.
+      So the thread is read through ``get_slack_link`` as well, and a non-empty
+      ``thread_ts`` refuses: the DM's mirror still equals its origin, and the
+      Slack thread is a room full of people who are not the owner.
 
     What this deliberately does NOT establish is unfenced reach: an admitted DM is
     creator-fenced by :func:`_caller_is_ownership_fenced`, so a wrong inference
     costs the sessions the DM created and never the person's own tabs. Group and
     thread sessions, every other channel, and ``channel.CHANNEL_AGENT_BLOCKED_TOOLS``
     are untouched.
-
-    The clause walk itself is :func:`owner_dm_refusal`, which names the first fact
-    that fails; this is its boolean face.
-    """
-    return not owner_dm_refusal(state, slot)
-
-
-ORIGIN_NOT_ON_RECORD = (
-    "this conversation's origin is not on record -- the channel dispatcher records "
-    "it on each inbound message and it is not kept across a gateway restart, so "
-    "send a message from the DM and retry"
-)
-"""The refusal an owner DM meets between a gateway restart and its next inbound turn.
-
-The origin (``SessionManager.get_origin_link``) is held in memory only, while the
-slot and its mirror are persisted and re-surfaced at boot -- so a monitor-loop cycle
-or a dashboard-tab turn that runs before the owner's next channel message finds
-every other clause satisfied and this one not. Naming it keeps a caller from
-hunting for a link it cannot clear; the exemption itself stays withheld, because a
-mirror without the recorded origin cannot be told from a retarget.
-"""
-
-
-def owner_dm_refusal(state: "DashboardState", slot: "_ChatSlot") -> str:
-    """Why *slot* is not the owner's own DM -- ``""`` when it is.
-
-    The clause-by-clause body of :func:`audience_is_owner`, kept as ONE function so
-    a gate that refuses can say which positive fact was missing without a second
-    walk that could disagree with the first. Every reason is generic -- a surface
-    name at most, never an id -- because it is rendered into the refusal the
-    caller reads in its own channel.
     """
     link = _channel_link_of(slot)
     if not link:
@@ -892,18 +904,24 @@ def owner_dm_refusal(state: "DashboardState", slot: "_ChatSlot") -> str:
     try:
         origin = sessions.get_origin_link(link)
         mirror = sessions.get_mirror_link(link)
+        slack_thread, _slack_channel = sessions.get_slack_link(link)
     except Exception:
         logger.debug("owner-DM check: session store unreadable for %s", link, exc_info=True)
         return "the session store is unreadable"
     if not isinstance(origin, ChannelLink):
         return ORIGIN_NOT_ON_RECORD
-    if mirror is None or (isinstance(mirror, ChannelLink) and mirror == origin):
+    if slack_thread:
+        return "the session also mirrors to a Slack thread"
+    if mirror is None or (
+        isinstance(mirror, ChannelLink)
+        and (mirror == origin or _is_unrouted_slack_placeholder(mirror))
+    ):
         return ""
     return "the outbound mirror points somewhere other than this conversation"
 
 
-def session_audience_is_owner(state: "DashboardState", session_key: str) -> bool:
-    """:func:`audience_is_owner` for a caller known only by its session key.
+def session_owner_dm_refusal(state: "DashboardState", session_key: str) -> str:
+    """:func:`owner_dm_refusal` for a caller known only by its session key.
 
     The ledger gate holds an ``X-Session-Key`` and no slot, so it resolves the
     slot the way every session-control verb does -- :func:`caller_slot_key`, the
@@ -913,12 +931,6 @@ def session_audience_is_owner(state: "DashboardState", session_key: str) -> bool
     coincide; a key that resolves to no open slot is refused, as
     :func:`authorize_target` refuses an unidentifiable caller.
     """
-    return not session_owner_dm_refusal(state, session_key)
-
-
-def session_owner_dm_refusal(state: "DashboardState", session_key: str) -> str:
-    """:func:`owner_dm_refusal` over the slot *session_key* resolves to; see
-    :func:`session_audience_is_owner` for why it resolves the way it does."""
     slot_key = caller_slot_key(state, session_key)
     slot = state.get_slot(slot_key) if slot_key else None
     if slot is None:
@@ -1458,14 +1470,14 @@ def _refuse_ineligible_creator(state: "DashboardState", caller_slot: "_ChatSlot"
             code="ephemeral_caller",
         )
     # The channel link and mirror refusals share ONE exemption with
-    # `authorize_target`'s caller half: :func:`audience_is_owner`, a 1:1 DM whose
-    # only human is the configured owner and whose mirror (if any) is that same
-    # DM. It waives both together, because the predicate has already established
-    # that the mirror IS the DM -- waiving the link alone would refuse every owner
-    # DM on the origin mirror its dispatcher binds each turn. The refusal names
-    # the clause that failed (:func:`owner_dm_refusal`): the code stays the same,
-    # but a DM that lost its origin to a gateway restart is told to send a message
-    # rather than left hunting for a link it cannot clear.
+    # `authorize_target`'s caller half: :func:`owner_dm_refusal` answering ``""``,
+    # a 1:1 DM whose only human is the configured owner and whose mirror (if any)
+    # is that same DM. It waives both together, because the predicate has already
+    # established that the mirror IS the DM -- waiving the link alone would refuse
+    # every owner DM on the origin mirror its dispatcher binds each turn. The
+    # refusal names the clause that failed: the code stays the same, but a DM that
+    # lost its origin to a gateway restart is told to send a message rather than
+    # left hunting for a link it cannot clear.
     if why := owner_dm_refusal(state, caller_slot):
         if _channel_link_of(caller_slot):
             # A cron tab's link is its own run transcript, not a channel thread,
@@ -2845,12 +2857,12 @@ def authorize_target(
         )
     # The one exemption from both caller-side channel refusals below, shared with
     # `_refuse_ineligible_creator` so the two halves cannot drift on WHO is exempt:
-    # :func:`audience_is_owner`, a 1:1 DM whose only human is the configured owner
-    # and whose mirror (if any) is that same DM. It waives both refusals together,
-    # because it has already established that the mirror IS the DM -- waiving the
-    # link alone would refuse every owner DM on the origin mirror its dispatcher
-    # binds each turn. An admitted DM is creator-fenced further down. The refusal
-    # names the clause that failed (:func:`owner_dm_refusal`), code unchanged.
+    # :func:`owner_dm_refusal` answering ``""``, a 1:1 DM whose only human is the
+    # configured owner and whose mirror (if any) is that same DM. It waives both
+    # refusals together, because it has already established that the mirror IS
+    # the DM -- waiving the link alone would refuse every owner DM on the origin
+    # mirror its dispatcher binds each turn. An admitted DM is creator-fenced
+    # further down. The refusal names the clause that failed, code unchanged.
     if why := owner_dm_refusal(state, caller_slot):
         if _channel_link_of(caller_slot):
             # The exfiltration direction, and the reason this is not merely the

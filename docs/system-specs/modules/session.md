@@ -2546,12 +2546,22 @@ only when a `mirror` `ChannelLink` exists on the dashboard-side key:
   the slot's `linked_session_key` — the channel session its turns run on — is
   untouched, inbound keeps routing to it, and nothing about what session control
   or the work ledger decide for that slot changes. Those gates judge a channel-born
-  slot by `session_control.audience_is_owner`, whose one exemption is a 1:1 DM
+  slot by `session_control.owner_dm_refusal`, whose one exemption is a 1:1 DM
   whose only human is the configured owner (see
   [session-control](session-control.md)); a thread session is refused before and
   after either endpoint, and an owner DM is admitted before and after — a paused or
-  cleared origin mirror is still the same audience. There is no "detach from
-  channel" action: a channel conversation stays a channel conversation.
+  cleared origin mirror is still the same audience. "Cleared" is the store's word,
+  not an empty read: `clear_mirror_link` pops the `mirror` row and leaves the
+  namespaced bucket the first inbound turn's `set_channel` stamped into the legacy
+  `slack_channel_id` field, so `get_mirror_link` reads back a threadless Slack
+  placeholder afterwards (`_is_unrouted_slack_placeholder`), and the predicate
+  reads that row as no mirror. The one dashboard action that DOES change the
+  verdict is `slack-link` on a channel-born slot: it binds the thread on the slot's
+  effective key — the channel session — beside the untouched origin mirror, and the
+  predicate reads that thread on its own (`get_slack_link`), because `get_mirror_link`
+  answers the `mirror` row alone when one exists; the owner DM is refused as
+  mirroring to a Slack thread until `slack-unlink` clears it. There is no "detach
+  from channel" action: a channel conversation stays a channel conversation.
 - **Three persisted pause markers, each keyed differently.** A mute must live and
   die with the binding the user muted, so the key follows what the flag is about:
   - `slack_paused` — the Slack thread. Cleared when the binding is REBOUND

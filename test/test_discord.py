@@ -3501,6 +3501,169 @@ class TestDispatcher:
         assert sess.origin_links == {}
 
     @pytest.mark.asyncio
+    async def test_a_dm_turn_opens_the_crew_log_the_work_ledger_writes_into(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The work ledger is a projection of the crew log: every write appends a
+        ``work/recorded`` entry to the ACTING session's log and rolls the cache back
+        (``crew_log_unrecorded``) when there is nowhere to append. A DM that session
+        control admits as a conductor therefore needs its log to exist before its
+        first ledger call, and only the turn path can create it -- the dashboard
+        runner does so on every turn, and this dispatcher runs its own turn loop.
+
+        Real emitter, real writer, isolated home. The admission itself is another
+        suite's subject (``test_session_control_owner_dm.py``) and is granted here.
+        """
+        import json
+
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+
+        from kiro_crew.crew_log import emit, projection
+        from kiro_crew.crew_log.resolve import unit_for_session_key
+        from kiro_crew.dashboard.handlers import work_ledger as ledger_routes
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+        monkeypatch.setattr(emit, "_retry_delay", lambda _attempts: 0.0)
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-owner-dm-turn", raising=False)
+        monkeypatch.setattr(FakeProvider, "served_model", "model-x", raising=False)
+        ledger_routes._BOARD_LOCKS.clear()
+
+        async def _recognized(*a: Any, **k: Any) -> None:
+            return None
+
+        monkeypatch.setattr(ledger_routes, "_recognize_session", _recognized)
+        monkeypatch.setattr(ledger_routes, "_is_restricted_session", lambda *a: False)
+        monkeypatch.setattr(ledger_routes, "_contained_channel_caller", lambda request, sk: "")
+        emit.reset_caches()
+        try:
+            d, _cli, sess = _dispatcher({"u1"})
+            d.ctx_builder.live_memory_mode_for_session = lambda key: "persistent"
+            await d.handle_message(self._msg("hello"))
+            key = d._session_key("u1", "")
+            unit = unit_for_session_key(sess, key)
+            assert unit == "acp-owner-dm-turn"
+
+            app = web.Application()
+            state = mock.MagicMock()
+            state.sessions = sess
+            app["state"] = state
+            req = make_mocked_request(
+                "POST", "/api/work-ledger/record", app=app, headers={"X-Session-Key": key}
+            )
+            req["internal_auth"] = True
+            req.json = mock.AsyncMock(  # type: ignore[method-assign]
+                return_value={"action": "goal", "goal": "ship it", "round": 1}
+            )
+            resp = await ledger_routes.api_work_ledger_record(req)
+            body = json.loads(resp.text)
+            assert (resp.status, body.get("code")) == (200, None), body
+
+            handle = projection.open_session_log(unit)
+            assert handle is not None
+            entries = list(handle.iter_from(1, known=projection.KNOWN_TYPES))
+            opened = [e for e in entries if e.type == "session/opened"]
+            assert len(opened) == 1
+            assert (opened[0].data["slot"], opened[0].data["agent"]) == (
+                key.replace(":", "_"),
+                "kirocrew",
+            )
+            assert opened[0].data["model"] == "model-x"
+            assert opened[0].data["class"] == {"memory": "persistent", "channel": True}
+            assert "parent" not in opened[0].data
+            assert [e.type for e in entries].count("work/recorded") == 1
+        finally:
+            emit.drain_for_shutdown(timeout=2.0)
+            emit.reset_caches()
+            ledger_routes._BOARD_LOCKS.clear()
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_dashboard_session_is_not_opened_by_the_channel(
+        self, monkeypatch
+    ) -> None:
+        """A dashboard session resumed into the chat is opened by the dashboard
+        runner, which alone holds its lineage (``_created_by``); an opener from here
+        would create that log without its ``parent``. The channel's own session is
+        opened, the resumed one is left to its owner."""
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        opened: list[str] = []
+        monkeypatch.setattr(
+            crew_log_emit,
+            "on_session_opened",
+            lambda session_id, **kw: opened.append(session_id),
+        )
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-any", raising=False)
+        d, _cli, _sess = _dispatcher({"u1"})
+        await d.handle_message(self._msg("hello"))
+        assert opened == ["acp-any"]
+
+    @pytest.mark.asyncio
+    async def test_a_recycled_conversation_opens_its_successor_log_citing_the_predecessor(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """A failed auto-compaction recycles the session: the pointer in the
+        slot-to-session mapping is emptied in place and the next turn cold-starts a
+        successor with a new id. Nothing but the ``previous`` edge on the successor's
+        ``session/opened`` joins the two crew logs, so without it the conversation's
+        earlier history falls off the succession chain. The dashboard runner reads
+        ``mapped_sid`` before its allocation for exactly this; the dispatcher must
+        read it at the same moment -- the recycle stashes the dropped id and
+        ``mapped_sid`` answers from that stash until the successor is mapped.
+
+        Real emitter and writer. The recycle is modelled at its observable seam: the
+        mapping still names the predecessor while the provider hands out a new id.
+        """
+        from kiro_crew.crew_log import emit, projection
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+        monkeypatch.setattr(emit, "_retry_delay", lambda _attempts: 0.0)
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-gen-1", raising=False)
+        emit.reset_caches()
+        try:
+            d, _cli, sess = _dispatcher({"u1"})
+            d.ctx_builder.live_memory_mode_for_session = lambda key: "persistent"
+            await d.handle_message(self._msg("hello"))
+            assert emit.flush(timeout=5.0)
+
+            # The recycle: the mapping keeps answering the dropped id from its stash
+            # (``SessionMap.mapped_sid`` reads ``discarded_sid``) while the next
+            # allocation cold-starts a successor under a new id.
+            sess.mapped_sid = lambda key: "acp-gen-1"
+            monkeypatch.setattr(FakeProvider, "session_id", "acp-gen-2", raising=False)
+            await d.handle_message(self._msg("and again"))
+            assert emit.flush(timeout=5.0)
+
+            handle = projection.open_session_log("acp-gen-2")
+            assert handle is not None
+            entries = list(handle.iter_from(1, known=projection.KNOWN_TYPES))
+            opened = [e for e in entries if e.type == "session/opened"]
+            assert len(opened) == 1
+            assert opened[0].data.get("previous") == {"sid": "acp-gen-1"}
+            # A warm turn maps the live id, so the successor's own next turn writes
+            # no edge and no second announcement.
+            sess.mapped_sid = lambda key: "acp-gen-2"
+            await d.handle_message(self._msg("still here"))
+            assert emit.flush(timeout=5.0)
+            entries = list(handle.iter_from(1, known=projection.KNOWN_TYPES))
+            assert [e.type for e in entries].count("session/opened") == 1
+        finally:
+            emit.drain_for_shutdown(timeout=2.0)
+            emit.reset_caches()
+
+        opened.clear()
+        d, cli, sess = _dispatcher({"u1"})
+        resumed = ChannelLink("discord", channel_id="c1")
+        sess.mirror_links["dashboard:chat-7"] = resumed
+        sess.inbound_mirror_keys.add("dashboard:chat-7")
+        await d.handle_message(self._msg("hello world"))
+        assert "Answer: hello world" in (cli.final_text() or ""), "the resumed turn ran"
+        assert sess.origin_links == {}, "the own-session branch was not taken"
+        assert opened == []
+
+    @pytest.mark.asyncio
     async def test_a_thread_route_is_still_bound_under_a_unified_scope(self) -> None:
         # A guild thread keys per-channel-peer regardless of dm_scope, so its
         # bucket still names one conversation.

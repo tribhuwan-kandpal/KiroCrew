@@ -78,6 +78,8 @@ from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     delivery_is_muted,
     driver_turn_landed,
+    open_turn_crew_log,
+    predecessor_sid,
     rearm_reinjection,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
@@ -796,6 +798,12 @@ class DiscordDispatcher:
         provider = None
         is_new = False
         resumed = False
+        # The crew log this conversation was writing, read BEFORE either
+        # ``get_or_create`` below maps the successor's id over it -- the same
+        # source and the same moment as the dashboard runner's latch. See
+        # ``predecessor_sid``: after a compaction recycle this is the only point
+        # at which the dropped id is still readable.
+        previous_sid = predecessor_sid(self.sessions, session_key)
         if monitor_completion is not None:
             if resumed_key is not None:
                 return MonitorDispatchResult.UNAVAILABLE
@@ -999,6 +1007,21 @@ class DiscordDispatcher:
                 # its own, having found the resume binding for this very channel —
                 # the placement is what keeps that from being load-bearing.)
                 self._bind_origin_mirror(session_key, channel_id)
+                # The session's crew log, opened before the turn the way the
+                # dashboard runner opens one: the work ledger appends every write
+                # to the acting session's log and rolls back one it cannot record,
+                # so a DM admitted as a conductor needs its log to exist before
+                # its first ledger call. Inside the same own-session branch as the
+                # origin record: a resumed dashboard session's opener is the
+                # dashboard's, which alone holds its lineage.
+                open_turn_crew_log(
+                    provider,
+                    session_key=session_key,
+                    agent=agent,
+                    resumed=resumed,
+                    ctx_builder=self.ctx_builder,
+                    previous_sid=previous_sid,
+                )
             # Publish this turn's session identity so managed MCP tools resolve
             # X-Session-Key; one shared writer lives in messaging.identity.
             await publish_turn_identity(self.sessions, session_key)

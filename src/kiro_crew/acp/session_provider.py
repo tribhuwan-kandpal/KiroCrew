@@ -160,6 +160,7 @@ class AcpSessionProvider(LLMProvider):
             cwd=self._runtime._work_dir,
             agent=self._runtime._agent or None,
             memory_mode=self.memory_mode,
+            session_key=self._session_key,
         )
         # Re-apply the configured non-default model to the fresh session. A new
         # session/new reverts to the agent-config default model, so a warm worker
@@ -617,6 +618,7 @@ class AcpSessionProvider(LLMProvider):
         self._channel_id = channel_id
         self._runtime._crew_agent = crew_agent
         self._handle.rebind_watchdog(crew_agent, settings=watchdog)
+        self._handle.bind_session_key(session_key)
         self._runtime._last_activity = time.monotonic()
         # Parity with AcpClient.rekey: the handle's prompt stats describe the
         # session this runtime served BEFORE the handoff; leaking them lets

@@ -762,3 +762,82 @@ class TestTeamsEarlyPress:
         first = decider._futures[_RID]
         decider.arm(_RID, "n2")
         assert decider._futures[_RID] is first
+
+
+class TestTheSweepReachesTheRealRegistry:
+    """The end-of-turn sweep must not travel through the construction seam.
+
+    Each dispatcher holds a module-level name for its decider class and calls it
+    to build the turn's decider. Callers and tests substitute that name to observe
+    which decider a turn constructs, and a substitute need not be a class at all.
+    Reservations live on the real class, so a sweep that resolved the class through
+    that name would aim at the substitute: it raises on a plain function, and on a
+    stand-in class it silently sweeps an empty registry and leaves the real window
+    armed past the end of its turn.
+    """
+
+    def test_the_slack_sweep_is_the_class_that_holds_the_reservations(self) -> None:
+        from kiro_crew.slack import transport_dispatch as slack_dispatch
+
+        assert slack_dispatch._APPROVAL_REGISTRY is SlackApprovalDecider
+
+    def test_the_telegram_sweep_is_the_class_that_holds_the_reservations(self) -> None:
+        from kiro_crew.telegram import transport_dispatch as telegram_dispatch
+
+        assert telegram_dispatch._APPROVAL_REGISTRY is TelegramApprovalDecider
+
+    @pytest.mark.asyncio
+    async def test_substituting_the_slack_construction_seam_leaves_the_sweep_working(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.slack import transport_dispatch as slack_dispatch
+
+        def spy(*a: Any, **k: Any) -> Any:
+            return SlackApprovalDecider(*a, **k)
+
+        monkeypatch.setattr(slack_dispatch, "SlackApprovalDecider", spy)
+        decider = spy(session_key=_SESSION)
+        decider.reserve(_RID)
+        assert _approval_registry_key(_SESSION, _RID) in SlackApprovalDecider._REGISTRY
+        slack_dispatch._APPROVAL_REGISTRY.discard_session(_SESSION)
+        assert _approval_registry_key(_SESSION, _RID) not in SlackApprovalDecider._REGISTRY
+
+    @pytest.mark.asyncio
+    async def test_substituting_the_telegram_construction_seam_leaves_the_sweep_working(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.telegram import transport_dispatch as telegram_dispatch
+
+        def spy(*a: Any, **k: Any) -> Any:
+            return TelegramApprovalDecider(*a, **k)
+
+        monkeypatch.setattr(telegram_dispatch, "TelegramApprovalDecider", spy)
+        key = TelegramApprovalDecider.key(_SESSION, _RID)
+        TelegramApprovalDecider.arm(key, "n1")
+        telegram_dispatch._APPROVAL_REGISTRY.discard_session(_SESSION)
+        assert TelegramApprovalDecider.is_pending(key, "n1") is False
+
+    @pytest.mark.parametrize(
+        ("module_name", "seam"),
+        [
+            ("kiro_crew.slack.transport_dispatch", "SlackApprovalDecider"),
+            ("kiro_crew.telegram.transport_dispatch", "TelegramApprovalDecider"),
+        ],
+    )
+    def test_no_dispatcher_sweeps_through_its_construction_seam(
+        self, module_name: str, seam: str
+    ) -> None:
+        """The source-level half, which the behavioural pins above cannot cover.
+
+        Calling the sweep on the alias works whatever the dispatcher does, so only
+        reading the dispatcher shows which name its own end-of-turn path uses.
+        """
+        import importlib
+        import inspect
+
+        source = inspect.getsource(importlib.import_module(module_name))
+        assert f"{seam}.discard_session" not in source, (
+            f"{module_name} sweeps reservations through {seam}, the name callers and "
+            "tests substitute -- use the registry alias instead"
+        )
+        assert "_APPROVAL_REGISTRY.discard_session(session_key)" in source

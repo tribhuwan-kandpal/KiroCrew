@@ -22,6 +22,13 @@ Five cases are pinned, which together are the whole window:
 * FALLBACK -- a hook that cannot surface the prompt, or one that raises, still
   answers ``None``, so a delivery fault degrades to Slack/dashboard.
 
+Answerability can also end by the conversation's OWN authorization rather than the
+`channels` ceiling: `on_callback` checks `_authorized` for a DM and the shared
+`forum_gate_outcome` for a Topic FIRST, for every press, with no reject exemption. A
+peer dropped from the roster or a Topic dropped from the allow-list therefore
+silences even a reject while the ceiling still permits, so that authority is re-read
+when the wait elapses too.
+
 All Telegram client I/O is faked; nothing touches the network, and the ceiling
 predicate is substituted rather than driven through a real profile store.
 """
@@ -315,6 +322,83 @@ class TestTheSeamOwnsTheReading:
         src = renderer_mod.__loader__.get_source("kiro_crew.telegram.renderer")
         assert "self.last_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT" in src
         assert DENY_CAUSE_APPROVAL_TIMEOUT == "approval_timeout"
+
+
+class TestTheConversationAuthorityAlsoEndsAnswerability:
+    """A roster or Topic withdrawal mid-wait silences every press, reject included."""
+
+    def test_a_roster_withdrawal_mid_wait_answers_none_not_false(self, _ceiling) -> None:
+        # `on_callback` checks this conversation's authorization FIRST, for every
+        # press, with no exemption -- so a peer dropped from the roster cannot even
+        # reject. The wait then elapses on a prompt nothing could answer, while the
+        # `channels` ceiling is untouched and still permits.
+        d, cli, _sess = _dispatcher({7})
+        session_key = d._session_key(("direct", "7"))
+        seam.register_channel_delivery("telegram", d.deliver_spawn_approval)
+
+        async def _go() -> bool | None:
+            task = asyncio.ensure_future(seam.deliver_spawn_approval(_RID, _TASK, session_key))
+            await _await_armed(session_key)
+            d._allowed = set()  # the operator drops the peer, as reconfigure does
+            return await task
+
+        result = asyncio.run(_go())
+
+        assert result is None
+        assert result is not False
+        assert len(cli.sent) == 1  # it WAS surfaced
+        # The channels ceiling never denied, so it cannot be what produced the
+        # fall-through: the conversation authority did.
+        assert _ceiling.state["permitted"] is True
+
+    def test_that_withdrawal_is_invisible_to_the_channels_ceiling(self, _ceiling) -> None:
+        # Spelled separately: the seam's answer for a permitted channel is False, so
+        # a fix that asked only the ceiling would refuse this spawn.
+        assert asyncio.run(seam.unpressed_wait_answer("telegram", _RID)) is False
+
+    def test_a_press_before_the_withdrawal_still_reports_its_decision(self, _ceiling) -> None:
+        # The withdrawal lands AFTER the operator rejected. That is a real decision
+        # and stays False rather than becoming a fall-through.
+        d, _cli, _sess = _dispatcher({7})
+        session_key = d._session_key(("direct", "7"))
+        seam.register_channel_delivery("telegram", d.deliver_spawn_approval)
+
+        async def _go() -> bool | None:
+            task = asyncio.ensure_future(seam.deliver_spawn_approval(_RID, _TASK, session_key))
+            await _press(d, session_key, "0")
+            d._allowed = set()
+            return await task
+
+        assert asyncio.run(_go()) is False
+
+    def test_an_authorized_conversation_on_a_permitted_channel_still_denies(self, _ceiling) -> None:
+        # The new check must not over-trigger: nothing was withdrawn, so an
+        # unpressed wait is still the operator declining to answer.
+        d, _cli, _sess = _dispatcher({7})
+        session_key = d._session_key(("direct", "7"))
+        seam.register_channel_delivery("telegram", d.deliver_spawn_approval)
+
+        assert asyncio.run(seam.deliver_spawn_approval(_RID, _TASK, session_key)) is False
+
+    def test_an_egress_revocation_mid_wait_also_falls_through(self, _ceiling) -> None:
+        # The transport's own revocation-at-egress decision is part of the same
+        # destination reading, so a transport that stops permitting the chat also
+        # makes the elapsed wait a fall-through.
+        d, _cli, _sess = _dispatcher({7})
+        session_key = d._session_key(("direct", "7"))
+        seam.register_channel_delivery("telegram", d.deliver_spawn_approval)
+        allow = {"ok": True}
+        d.transport = SimpleNamespace(  # type: ignore[assignment]
+            may_send_to=lambda _c, _t=None, **_k: allow["ok"]
+        )
+
+        async def _go() -> bool | None:
+            task = asyncio.ensure_future(seam.deliver_spawn_approval(_RID, _TASK, session_key))
+            await _await_armed(session_key)
+            allow["ok"] = False
+            return await task
+
+        assert asyncio.run(_go()) is None
 
 
 class TestADeliveryFaultStillFallsThrough:

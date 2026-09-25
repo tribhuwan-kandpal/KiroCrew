@@ -3229,14 +3229,16 @@ class TelegramDispatcher:
         generation, so the recomputed key does not match the armed one, the press
         resolves nothing, and the prompt deny-by-defaults at the timeout (the user
         sees "already expired"). This mirrors how a mid-run tool prompt behaves
-        across a rotation. An elapsed wait on a channel that is still permitted is
-        a DENY and NOT a fall-through: the prompt was surfaced, so ``False`` is a
-        real decision and the gate refuses the spawn on it. An elapsed wait once
-        the ``channels`` ceiling denies this channel is a fall-through instead,
-        because the callback path drops every press but an explicit reject from
-        that moment on, leaving the prompt unanswerable here; that reading belongs
-        to the seam (``unpressed_wait_answer``), which owns the ceiling for every
-        channel.
+        across a rotation. An elapsed wait is a DENY only while the prompt stayed
+        answerable for the whole wait: the prompt was surfaced, so ``False`` is a
+        real decision and the gate refuses the spawn on it. An elapsed wait whose
+        prompt STOPPED being answerable is a fall-through instead, because no press
+        could have resolved it. Two authorities can end answerability mid-wait and
+        both are re-read when the wait elapses: this conversation's own
+        authorization, which ``on_callback`` checks first for every press with no
+        exemption (``_spawn_prompt_destination_permitted``, the same pair consulted
+        before posting), and the operator's ``channels`` ceiling, whose reading
+        belongs to the seam (``unpressed_wait_answer``) for every channel.
         """
         client = self.client
         if client is None:
@@ -3304,13 +3306,32 @@ class TelegramDispatcher:
         event = SimpleNamespace(request_id=rid)
         approved = bool(await decider(event))
         if not approved and decider.last_deny_cause == DENY_CAUSE_APPROVAL_TIMEOUT:
-            # Nobody pressed. Whether an elapsed wait is a deny-by-default or a
-            # fall-through depends on the channels ceiling, which is the seam's to
-            # read: a deny that landed while this prompt was pending makes it
-            # unanswerable here, so reporting ``False`` would refuse the spawn in
-            # the operator's name. A press — approve, trust, or an explicit reject,
-            # which the callback path exempts from a denied channel's drop — is the
-            # operator's own decision and is returned verbatim below.
+            # Nobody pressed. An elapsed wait is a deny-by-default only while the
+            # prompt was answerable for the whole wait; once it stopped being
+            # answerable, reporting ``False`` would refuse the spawn in the
+            # operator's name. Two authorities can end that, and both are asked:
+            #
+            # * this conversation's own authorization, which ``on_callback`` checks
+            #   FIRST for every press (``_authorized`` for a DM, the shared
+            #   ``forum_gate_outcome`` for a Topic) with no exemption, so a peer
+            #   dropped from the roster or a Topic dropped from the allow-list
+            #   silences even a reject. ``_spawn_prompt_destination_permitted`` is
+            #   the same pair this method already consults before posting, read
+            #   here as "could a press still have been honored";
+            # * the operator's ``channels`` ceiling, which the seam owns for every
+            #   channel (``unpressed_wait_answer``).
+            #
+            # A press — approve, trust, or the explicit reject the channels drop
+            # exempts — is the operator's own decision and is returned verbatim
+            # below, so a real refusal never becomes a fall-through.
+            if not self._spawn_prompt_destination_permitted(chat_id, thread_id):
+                logger.info(
+                    "Telegram: the spawn-approval prompt for %s went unanswered and "
+                    "its conversation is not authorized, so no press could have "
+                    "resolved it; falling through to the Slack/dashboard path",
+                    rid,
+                )
+                return None
             return await unpressed_wait_answer("telegram", rid)
         return approved
 

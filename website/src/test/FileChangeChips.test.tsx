@@ -131,6 +131,85 @@ describe('FileChangeChips', () => {
     expect(screen.queryByLabelText('Show or hide the diff for /large.ts')).not.toBeInTheDocument()
   })
 
+  const TURN_SENTENCE = "This turn's changes were too large to keep every diff (over 400,000 characters total)."
+  const OPEN_HINT = 'Click a file name to open it.'
+  const demoted = (path: string) => ({ ...change(path, '', ''), truncated: true, content_omitted: true, turn_budget_chars: 400_000 })
+
+  it('names the turn budget, not this file\'s size, when a turn drops a file\'s content', () => {
+    // A small file demoted to path-only must not be described as too large:
+    // the size that ran out belongs to the turn, not to this file.
+    render(<FileChangeChips fileChanges={[demoted('/small.ts')]} />)
+    expect(screen.getByText(TURN_SENTENCE)).toBeInTheDocument()
+    expect(screen.queryByText(/too large to compare/)).not.toBeInTheDocument()
+  })
+
+  it('says the turn-budget sentence once per card and tags each demoted row', () => {
+    // The sentence describes the turn. Three demoted rows carry three short
+    // tags under ONE notice row, so each row keeps its width for the filename.
+    const { container } = render(
+      <FileChangeChips fileChanges={[change('/kept.ts', 'a', 'a\nb'), demoted('/a.ts'), demoted('/b.ts'), demoted('/c.ts')]} />,
+    )
+    expect(screen.getAllByText(TURN_SENTENCE)).toHaveLength(1)
+    expect(container.querySelector('[data-fcc-turn-notice]')).toBeInTheDocument()
+    expect(screen.getAllByText('Diff not kept')).toHaveLength(3)
+    for (const path of ['/a.ts', '/b.ts', '/c.ts']) {
+      expect(screen.getByTestId(`fcc-row-${path}`).querySelector('[data-fcc-demoted-tag]')).toBeInTheDocument()
+    }
+    expect(screen.getByTestId('fcc-row-/kept.ts').querySelector('[data-fcc-demoted-tag]')).toBeNull()
+  })
+
+  it('renders no notice row and no tag when nothing was demoted', () => {
+    const { container } = render(<FileChangeChips fileChanges={[change('/kept.ts', 'a', 'a\nb')]} />)
+    expect(container.querySelector('[data-fcc-turn-notice]')).toBeNull()
+    expect(screen.queryByText('Diff not kept')).not.toBeInTheDocument()
+  })
+
+  it('keeps the per-file notice on its own row: that one really is about one file', () => {
+    const large = { ...change('/large.ts', 'same', 'same'), truncated: true, snapshot_limit_chars: 200_000 }
+    render(<FileChangeChips fileChanges={[large, demoted('/small.ts')]} />)
+    expect(screen.getByTestId('fcc-row-/large.ts')).toHaveTextContent('Diff unavailable: file is too large to compare (over 200,000 characters).')
+    expect(screen.getByTestId('fcc-row-/large.ts').querySelector('[data-fcc-demoted-tag]')).toBeNull()
+    expect(screen.getByTestId('fcc-row-/small.ts')).toHaveTextContent('Diff not kept')
+    expect(screen.getByTestId('fcc-row-/small.ts')).not.toHaveTextContent(/too large/)
+  })
+
+  it('tells the reader the files still open only when opening is wired', () => {
+    // A demoted row's filename is a button exactly when onFileOpen exists;
+    // the hint must not promise a click that does nothing.
+    const onFileOpen = vi.fn()
+    const { unmount } = render(<FileChangeChips fileChanges={[demoted('/small.ts')]} onFileOpen={onFileOpen} />)
+    expect(screen.getByText(new RegExp(OPEN_HINT.replace('.', '\\.')))).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Open /small.ts in side panel' }))
+    expect(onFileOpen).toHaveBeenCalledWith('/small.ts')
+    unmount()
+    render(<FileChangeChips fileChanges={[demoted('/small.ts')]} />)
+    expect(screen.queryByText(/Click a file name/)).not.toBeInTheDocument()
+  })
+
+  it('minimal style keeps the whole turn-budget sentence in the pill, never the row tag', () => {
+    // A pill stands alone with no card to carry the sentence for it.
+    render(<FileChangeChips fileChanges={[demoted('/small.ts')]} style="minimal" />)
+    expect(screen.getByLabelText('/small.ts')).toHaveTextContent(TURN_SENTENCE)
+    expect(screen.queryByText('Diff not kept')).not.toBeInTheDocument()
+    expect(screen.queryByText(/too large to compare/)).not.toBeInTheDocument()
+  })
+
+  it('opens a path-only minimal chip as the file, not an empty diff', () => {
+    const onOpenDiff = vi.fn()
+    const onFileOpen = vi.fn()
+    render(
+      <FileChangeChips
+        fileChanges={[demoted('/small.ts')]}
+        style="minimal"
+        onOpenDiff={onOpenDiff}
+        onFileOpen={onFileOpen}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: '/small.ts' }))
+    expect(onFileOpen).toHaveBeenCalledWith('/small.ts')
+    expect(onOpenDiff).not.toHaveBeenCalled()
+  })
+
   it('suppresses aggregate totals when any snapshot in the batch is truncated', () => {
     const truncated = { ...change('/large.ts', 'same', 'same'), truncated: true, snapshot_limit_chars: 200_000 }
     render(<FileChangeChips fileChanges={[truncated, change('/complete.ts', 'a', 'a\nb')]} />)

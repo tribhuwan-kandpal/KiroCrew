@@ -22,13 +22,57 @@ export interface FileChangeEntry {
   after: string
   truncated?: boolean
   snapshot_limit_chars?: number
+  /** Content dropped because the whole turn outgrew its snapshot budget, not
+   *  because this one file did. The path is still recorded, so the row opens
+   *  the real file. */
+  content_omitted?: boolean
+  turn_budget_chars?: number
 }
 
 const LEGACY_SNAPSHOT_LIMIT_CHARS = 200_000
 
+const turnBudgetSentence = (fc: FileChangeEntry) =>
+  i18nT('components.fileChangeChips.diff_unavailable_turn_snapshot_budget', {
+    limit: fmtNumber(fc.turn_budget_chars ?? LEGACY_SNAPSHOT_LIMIT_CHARS * 2),
+  })
+
+/* Both reasons a row carries no diff render here, and they are NOT the same
+ * sentence: one file outgrew the per-file cap, or the turn as a whole outgrew
+ * its budget and this file's content was dropped to keep the newest changes
+ * complete. Telling a small file's owner it was "too large to compare" sends
+ * them looking for a size problem that is not theirs.
+ *
+ * A minimal pill stands alone, so it carries whichever sentence applies. The
+ * expanded card says the turn-budget sentence ONCE (`TurnBudgetNotice`) and a
+ * demoted row wears only `DemotedTag`: the sentence describes the turn, and
+ * repeating it per row squeezes each row's filename — the one fact that
+ * differs between rows — into an ellipsis to make room. */
 function TruncatedNotice({ fc }: { fc: FileChangeEntry }) {
+  if (fc.content_omitted) {
+    return <span className="text-muted text-[11px] italic">{turnBudgetSentence(fc)}</span>
+  }
   const limit = fmtNumber(fc.snapshot_limit_chars ?? LEGACY_SNAPSHOT_LIMIT_CHARS)
   return <span className="text-muted text-[11px] italic">{i18nT('components.fileChangeChips.diff_unavailable_file_exceeds_snapshot_limit', { limit })}</span>
+}
+
+/** Same pill as the artifact badge, so a demoted row gains a tag in a shape
+ *  the row already uses rather than a second style of caption. */
+function DemotedTag() {
+  return <span data-fcc-demoted-tag className="shrink-0 text-[10px] leading-none px-1.5 py-0.5 rounded-full border border-border text-muted font-medium">{i18nT('components.fileChangeChips.diff_not_kept')}</span>
+}
+
+/* One notice row directly beneath the card header, in the header's face.
+ * The open hint renders only when a file-open handler exists: a demoted row's
+ * filename is a button exactly then, and the hint must not promise a click
+ * that does nothing. It is status about a turn, not the outcome of a failed
+ * request, so it is plain text and not an ErrorNotice. */
+function TurnBudgetNotice({ fc, canOpen }: { fc: FileChangeEntry; canOpen: boolean }) {
+  return (
+    <div data-fcc-turn-notice className="px-[10px] py-1.5 border-b border-border font-mono text-[11px] leading-[18px] text-muted italic">
+      {turnBudgetSentence(fc)}
+      {canOpen && <> {i18nT('components.fileChangeChips.turn_snapshot_budget_open_hint')}</>}
+    </div>
+  )
 }
 
 /** Re-exported for this component's existing importers; defined in
@@ -187,7 +231,7 @@ function TruncatedRow({ fc, isArtifact, onFileOpen }: {
           <span className="min-w-0 truncate" title={fc.path} data-fcc-filename>{name}</span>
         )}
         {isArtifact && <span data-fcc-artifact-badge className="shrink-0 text-[10px] leading-none px-1.5 py-0.5 rounded-full border border-border text-muted font-medium">{i18nT('components.fileChangeChips.artifact')}</span>}
-        <span className="ml-auto"><TruncatedNotice fc={fc} /></span>
+        <span className="ml-auto shrink-0">{fc.content_omitted ? <DemotedTag /> : <TruncatedNotice fc={fc} />}</span>
       </div>
     </div>
   )
@@ -444,6 +488,9 @@ function ExpandedList({ fileChanges, onFileOpen, artifactPaths, disclosureKey }:
   const stats = fileChanges.map(fc => fc.truncated ? { added: 0, removed: 0 } : countLines(fc.before, fc.after))
   const hasTruncatedSnapshot = fileChanges.some(fc => fc.truncated)
   const hasCompleteDiff = fileChanges.some(fc => !fc.truncated)
+  // Every demoted entry in one turn carries the same budget, so the first one
+  // speaks for the card.
+  const demoted = fileChanges.find(fc => fc.content_omitted)
   const totalAdded = stats.reduce((s, x) => s + x.added, 0)
   const totalRemoved = stats.reduce((s, x) => s + x.removed, 0)
   const overflow = n > COLLAPSED_COUNT
@@ -480,6 +527,7 @@ function ExpandedList({ fileChanges, onFileOpen, artifactPaths, disclosureKey }:
             has no hover reveal, unlike DiffBlock's slotted controls. */}
         {hasCompleteDiff && <button onClick={() => setSideBySide(v => !v)} className={`ml-auto flex items-center justify-center w-[22px] h-[22px] rounded-md cursor-pointer transition-colors border-none shrink-0 ${sideBySide ? 'text-accent bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'}`} title={sideBySide ? i18nT('components.fileChangeChips.switch_to_unified_view') : i18nT('components.fileChangeChips.switch_to_split_view')} aria-label={sideBySide ? i18nT('components.fileChangeChips.switch_to_unified_view') : i18nT('components.fileChangeChips.switch_to_split_view')}><Columns2 size={13} /></button>}
       </div>
+      {demoted && <TurnBudgetNotice fc={demoted} canOpen={!!onFileOpen} />}
       <div className="flex flex-col">
         {fileChanges.slice(0, visibleCount).map((fc, i) => (
           fc.truncated ? (
